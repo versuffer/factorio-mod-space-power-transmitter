@@ -1,0 +1,9 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 18. 10. 2026
+  Features:
+  - Links a planet or space platform to the common space power grid: transfers energy through space over any distance, moving space platforms included.
+  - Energy flows in both directions between all linked surfaces of one force and is rationed proportionally to demand when production falls short.
+  - The transmitter draws a constant upkeep power to hold the link (600 MW by default; higher quality draws less); the link drops when the local network cannot supply it and is restored automatically once it can again.
+  - Unlocked with Cryogenic science (researchable on Aquilo).
+---------------------------------------------------------------------------------------------------

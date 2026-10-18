@@ -1,0 +1,13 @@
+{
+  "name": "space-power-transmitter",
+  "version": "1.0.0",
+  "title": "Space Power Transmitter",
+  "author": "versuffer",
+  "description": "Adds Space Power Transmitter that links any planet or space platform - even a moving one - to the common space power grid: bidirectional energy transfer through space over any distance, rationed by demand. Draws a constant upkeep to hold the link (600 MW by default, less at higher quality); the link drops if the local network cannot supply it and restores automatically once it can. Unlocked with Cryogenic science (researchable on Aquilo).",
+  "factorio_version": "2.1",
+  "space_travel_required": true,
+  "dependencies": [
+    "base >= 2.1.22",
+    "space-age >= 2.1.22"
+  ]
+}
