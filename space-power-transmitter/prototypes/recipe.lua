@@ -1,3 +1,9 @@
+-- the hum machine's always-on recipe: no ingredients, no products, pure sound driver
+-- (the modular-nuclear-reactor / Space Exploration fixed-recipe pattern)
+data:extend({
+  { type = "recipe-category", name = "spt-fixed-recipe" },
+})
+
 return {
   {
     type = "recipe",
@@ -14,5 +20,17 @@ return {
     },
     results = { { type = "item", name = "space-power-transmitter", amount = 1 } },
     enabled = false,
+  },
+  {
+    type = "recipe",
+    name = "spt-hum-idle",
+    icon = "__space-power-transmitter__/graphics/icons/space-power-transmitter.png",
+    icon_size = 64,
+    categories = { "spt-fixed-recipe" },
+    energy_required = 1,
+    ingredients = {},
+    results = {},
+    hidden = true,
+    enabled = true,
   },
 }

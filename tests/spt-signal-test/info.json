@@ -1,0 +1,13 @@
+{
+  "name": "spt-signal-test",
+  "version": "0.1.0",
+  "title": "SPT Signal Test",
+  "author": "versuffer",
+  "description": "Headless end-to-end test driver for the space-power-transmitter circuit features (link status signals, Enable if, save/load rebuild). Enabled only by tests/run.sh in a temporary mod directory; never ship or enable it in a real game.",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1.22",
+    "space-age >= 2.1.22",
+    "space-power-transmitter >= 1.2.0"
+  ]
+}

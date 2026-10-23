@@ -1,4 +1,31 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.2.0
+Date: 23. 10. 2026
+  Features:
+  - The transmitter can be wired into a circuit network and broadcasts its link status as virtual signals: spt-link-up (healthy link) and spt-link-failing (the local network stopped paying the upkeep - the link drops within seconds); both signals absent means the link is down.
+  - Circuit "Enable if" condition (a small panel next to the transmitter's window, also available through the remote interface): while it is false the transmitter is off - no link, no upkeep drain, no link-lost alert. The condition transfers with the copy-paste tool and in blueprints.
+  - The panel has a Wire selector (Both / Red / Green): it picks the wire color that carries the status signals and is watched by the Enable if condition.
+  - The hidden status combinator sits offset from the transmitter, so it no longer blocks super force build (ctrl+shift+click) of transmitter blueprints over the existing entity.
+  - The transmitter now has a circuit connector (the accumulator socket); the status signals ride on both wire colors via an invisible script-wired combinator.
+  - The transmitter's own (meaningless) accumulator charge signal is suppressed on the circuit network.
+  Bugfixes:
+  - The status signal survived saving and loading: script wires and the combinator slot are rebuilt on session start (script wires are not serialized by the engine).
+---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 18. 10. 2026
+  Features:
+  - The beam column now carries a travelling energy ripple (24-frame seamless loop).
+  - The transmitter flickers in sync with the beam while the link is up.
+  - The transmitter hums with an electric loop while the local network can power it (hidden sound driver, Space Exploration / modular-nuclear-reactor pattern).
+  - The hull is pre-shaded dark blue with the emissive parts kept white, and the shadow is sharpened.
+  - Added a hidden always-on sound driver entity (spt-hum) tracked as a transmitter child.
+  - New 620x620 thumbnail.
+---------------------------------------------------------------------------------------------------
+Version: 1.0.1
+Date: 18. 10. 2026
+  Bugfixes:
+  - Fixed the transmitter glow overlay rendering half a tile above the structure (draw_as_light layers are anchored 16px higher by the engine; the glow layer's y-shift is compensated).
+---------------------------------------------------------------------------------------------------
 Version: 1.0.0
 Date: 18. 10. 2026
   Features:

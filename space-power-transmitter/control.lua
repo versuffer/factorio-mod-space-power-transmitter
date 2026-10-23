@@ -1,8 +1,10 @@
 local TRANSMITTER_NAME = "space-power-transmitter"
 local BEAM_NAME = "spt-beam"
+local HUM_NAME = "spt-hum"
 local IMPORT_PORT_NAME = "spt-import-port"
 local EXPORT_PORT_NAME = "spt-export-port"
 local UPKEEP_PORT_PREFIX = "spt-upkeep-port-"
+local STATUS_COMBINATOR_NAME = "spt-status-combinator"
 
 local RELINK_PAID_TICKS = 60
 local STARVE_LIMIT = 300
@@ -21,6 +23,61 @@ local FORCE_CHECK_PERIOD = 60
 local PORT_KEYS = { "import", "export", "upkeep" }
 local EXCHANGE_KEYS = { "import", "export" }
 
+-- link status broadcast to the circuit network by the hidden status combinator:
+-- spt-link-up = 1 while the link is healthy, spt-link-failing = 1 while the upkeep
+-- is not being paid (the link will drop soon); both absent = the link is down
+local SIGNAL_NONE, SIGNAL_UP, SIGNAL_FAILING = 0, 1, 2
+local SIGNAL_NAME = {
+  [SIGNAL_UP] = "spt-link-up",
+  [SIGNAL_FAILING] = "spt-link-failing",
+}
+-- the wire connector set for a wire choice; shared read-only tables: the hot loop
+-- must not allocate
+local CONNECTORS = {
+  both = {
+    [defines.wire_connector_id.circuit_red] = true,
+    [defines.wire_connector_id.circuit_green] = true,
+  },
+  red = { [defines.wire_connector_id.circuit_red] = true },
+  green = { [defines.wire_connector_id.circuit_green] = true },
+}
+local WIRE_CONNECTOR_IDS = {
+  defines.wire_connector_id.circuit_red,
+  defines.wire_connector_id.circuit_green,
+}
+
+-- dropdown rows in the Enable-if GUI, same keys as the CONNECTORS table
+local WIRE_CHOICES = { "both", "red", "green" }
+local WIRE_INDEX = { both = 1, red = 2, green = 3 }
+local WIRE_ITEMS = { { "spt-enable.wire-both" }, { "spt-enable.wire-red" }, { "spt-enable.wire-green" } }
+
+-- validates a wire choice read back from tags/paste: anything else means "absent"
+local function wire_choice(value)
+  return WIRE_INDEX[value] and value or nil
+end
+
+-- the status combinator sits offset from the transmitter's center: at the exact
+-- center its hidden entity blocks super force build (ctrl+shift+click) of
+-- transmitter blueprints over the existing entity
+local STATUS_OFFSET = { 0, -3 }
+
+local function status_combinator_position(entity)
+  return { entity.position.x + STATUS_OFFSET[1], entity.position.y + STATUS_OFFSET[2] }
+end
+-- circuit "Enable if": while the condition is false the transmitter is off - it
+-- holds no link and consumes no upkeep. API comparator strings, in GUI order
+-- (the GUI shows the vanilla glyphs).
+local COMPARATOR_CHOICES = { ">", ">=", "<", "<=", "=", "≠" }
+local COMPARATOR_GLYPHS = { ">", "≥", "<", "≤", "=", "≠" }
+local COMPARATOR_FUNCTIONS = {
+  [">"] = function(value, constant) return value > constant end,
+  [">="] = function(value, constant) return value >= constant end,
+  ["<"] = function(value, constant) return value < constant end,
+  ["<="] = function(value, constant) return value <= constant end,
+  ["="] = function(value, constant) return value == constant end,
+  ["≠"] = function(value, constant) return value ~= constant end,
+}
+
 -- transmitters awaiting re-registration after a force change: the registry is
 -- being iterated on this tick, so the rebuild waits for the pass to finish
 local deferred_registrations = {}
@@ -34,6 +91,10 @@ local BASE_UPKEEP = power.upkeep_watts()
 
 -- forward declaration: defined after on_tick
 local update_tick_handler
+
+-- forward declaration: defined in the settings-paste section; registration applies
+-- the entity's own tags (engine re-creations and clones carry them)
+local apply_enable_settings
 
 local function upkeep_rate_per_tick(quality)
   return BASE_UPKEEP * (power.QUALITY_MULTIPLIERS[quality] or 1) / 60
@@ -156,6 +217,7 @@ local function init_storage()
   storage.by_force = storage.by_force or {}
   storage.child_regs = storage.child_regs or {}
   storage.force_index_by_name = storage.force_index_by_name or {}
+  storage.enable_guis = storage.enable_guis or {}
 end
 
 local function destroy_if_valid(entity)
@@ -186,6 +248,129 @@ local function clear_link_alert(T)
   T.entity.force.remove_alert({ type = ALERT_TYPE_CUSTOM, entity = T.entity })
 end
 
+-- a manual section holding slot 1 = the one active status signal (a down link
+-- clears the slot, so both signals read as absent); the engine broadcasts it on
+-- every connected network for free
+local function write_status_signal(T)
+  local combinator = T.status_combinator
+  if not (combinator and combinator.valid) then return end
+  local behavior = combinator.get_or_create_control_behavior()
+  if not behavior then return end
+  local section = behavior.get_section(1)
+  if not section then section = behavior.add_section() end
+  if not section then return end
+  section.active = true
+  local signal_name = SIGNAL_NAME[T.signal_state]
+  if signal_name then
+    section.set_slot(1, {
+      value = { type = "virtual", name = signal_name, quality = "normal" },
+      min = 1,
+    })
+  else
+    section.clear_slot(1)
+  end
+end
+
+-- keeps the invisible script wires in sync with the player's own wiring: the hidden
+-- status combinator joins a connector only while the player has wired that connector
+-- themselves. An unwired transmitter then has no circuit network at all - exactly like
+-- any other unwired entity - so the native "Circuit connection" GUI section stays away.
+-- Self-healing on save/load: script wires are not serialized, player wires are, and
+-- the check runs against the actual connection state, not a stored flag.
+local function refresh_status_wiring(T)
+  local entity = T.entity
+  local combinator = T.status_combinator
+  if not (entity and entity.valid and combinator and combinator.valid) then return end
+  local chosen = CONNECTORS[T.wire_out]
+  local changed = false
+  for _, connector_id in ipairs(WIRE_CONNECTOR_IDS) do
+    -- no create: an unallocated connector means no wires to inspect or detach
+    local transmitter_connector = entity.get_wire_connector(connector_id, false)
+    if transmitter_connector then
+      local player_wired, script_wired = false, false
+      for _, connection in ipairs(transmitter_connector.connections) do
+        if connection.origin == defines.wire_origin.player then
+          player_wired = true
+        elseif connection.origin == defines.wire_origin.script then
+          script_wired = true
+        end
+      end
+      local should = player_wired and chosen[connector_id]
+      if should and not script_wired then
+        local combinator_connector = combinator.get_wire_connector(connector_id, true)
+        if combinator_connector then
+          combinator_connector.connect_to(transmitter_connector, false, defines.wire_origin.script)
+          changed = true
+        end
+      elseif not should and script_wired then
+        -- a script wire implies both connectors exist
+        local combinator_connector = combinator.get_wire_connector(connector_id, false)
+        if combinator_connector then
+          combinator_connector.disconnect_from(transmitter_connector, defines.wire_origin.script)
+          changed = true
+        end
+      end
+    end
+  end
+  if changed then
+    -- a fresh attach must restore the broadcast (the combinator slot does not
+    -- reliably survive save/load either)
+    if not T.disabled then write_status_signal(T) end
+    -- the accumulator's own charge signal is noise next to the status signals
+    local behavior = entity.get_or_create_control_behavior()
+    if behavior and behavior.read_charge then behavior.read_charge = false end
+  end
+end
+
+-- the Enable-if panel shows only while the transmitter is wired into a circuit
+-- network, like the native "Circuit connection" section. Any connection counts: the
+-- script wires exist only while the player wires the transmitter themselves, so this
+-- is exactly "the transmitter has a circuit network".
+local function transmitter_is_wired(entity)
+  for _, connector_id in ipairs(WIRE_CONNECTOR_IDS) do
+    local connector = entity.get_wire_connector(connector_id, false)
+    if connector and #connector.connections > 0 then return true end
+  end
+  return false
+end
+
+-- circuit "Enable if" settings travel with copies, blueprints and entity clones
+local ENABLE_CONDITION_TAG = "spt_enable_condition"
+local ENABLE_WIRE_IN_TAG = "spt_enable_wire_in"
+local ENABLE_WIRE_OUT_TAG = "spt_enable_wire_out"
+
+-- the condition and the wire choices live in entity.tags: they survive blueprint
+-- copies (the setup handler reads them) and engine re-creations
+local function copy_condition(condition)
+  if not condition then return nil end
+  return {
+    signal = { type = condition.signal.type, name = condition.signal.name },
+    comparator = condition.comparator,
+    constant = condition.constant,
+  }
+end
+
+-- the enable condition reads the signal from both wire colors (vanilla machines
+-- sum them too); no condition means always enabled
+local function evaluate_enable_condition(T)
+  local condition = T.enable_condition
+  if not condition then return true end
+  local entity = T.entity
+  if not (entity and entity.valid) then return true end
+  local chosen = CONNECTORS[T.wire_in]
+  local value = 0
+  -- fixed order (not pairs over the set): the float sum must stay deterministic
+  for _, connector_id in ipairs(WIRE_CONNECTOR_IDS) do
+    if chosen[connector_id] then
+      local network = entity.get_circuit_network(connector_id)
+      if network then
+        value = value + network.get_signal(condition.signal)
+      end
+    end
+  end
+  return COMPARATOR_FUNCTIONS[condition.comparator](value, condition.constant)
+end
+
 local function set_link(T, up)
   if up then
     if not T.link_down then return end
@@ -198,11 +383,14 @@ local function set_link(T, up)
     clear_link_alert(T)
   else
     if T.link_down then return end
-    -- no warning icon: the unlit beam is the down-link indicator
+    -- no warning icon: the unlit beam is the down-link indicator - and a
+    -- deliberately disabled transmitter must not raise the alert at all
     T.link_down = true
     set_beam(T, false)
-    notify_link_dropped(T)
-    T.alert_refresh = 60
+    if not T.disabled then
+      notify_link_dropped(T)
+      T.alert_refresh = 60
+    end
   end
 end
 
@@ -227,11 +415,12 @@ end
 -- lost-validity races would otherwise leave duplicates at the tile); extra duplicates
 -- beyond the first are destroyed. Returns the adopted entity or a fresh one (nil when
 -- the create failed). A nil create_smoke keeps the default build smoke.
-local function adopt_or_create(entity, name, create_smoke)
+local function adopt_or_create(entity, name, create_smoke, position)
+  position = position or entity.position
   local found
   for _, orphan in ipairs(entity.surface.find_entities_filtered({
       name = name,
-      position = entity.position,
+      position = position,
       radius = 0.1,
     })) do
     if orphan.valid and orphan.force == entity.force then
@@ -245,16 +434,21 @@ local function adopt_or_create(entity, name, create_smoke)
   if found then return found end
   return entity.surface.create_entity({
     name = name,
-    position = entity.position,
+    position = position,
     force = entity.force,
     create_build_effect_smoke = create_smoke,
   })
 end
 
+-- Recreate a lost child (port, beam, hum, combinator): each recreator returns the
+-- still-valid child, adopts a valid orphan left at the tile, or creates a fresh
+-- entity (nil when the create failed - a failed recreate sets children_dirty so the
+-- caller backs off). A recreate flags the tile for the duplicate scan.
 local function recreate_port(T, key)
+  local port = T.ports[key]
+  if port and port.valid then return port end
   local entity = T.entity
   if not (entity and entity.valid) then return nil end
-  -- something was recreated: the tile needs a duplicate scan
   T.rescan = true
   local name
   if key == "import" then
@@ -264,7 +458,7 @@ local function recreate_port(T, key)
   else
     name = upkeep_port_name(T.quality)
   end
-  local port = adopt_or_create(entity, name)
+  port = adopt_or_create(entity, name)
   T.ports[key] = port
   track_child(T, key, port)
   if port then
@@ -273,18 +467,68 @@ local function recreate_port(T, key)
       -- a fresh baseline: the adopted port's current charge must not read as a grid draw
       T.import_pending = port.energy
     end
+  else
+    T.children_dirty = true
   end
   return port
 end
 
 local function recreate_beam(T)
+  if T.beam and T.beam.valid then return T.beam end
   local entity = T.entity
   if not (entity and entity.valid) then return nil end
+  T.rescan = true
   local beam = adopt_or_create(entity, BEAM_NAME, false)
-  if beam then beam.render_to_forces = T.beam_active and {} or "neutral" end
+  if beam then
+    beam.render_to_forces = T.beam_active and {} or "neutral"
+  else
+    T.children_dirty = true
+  end
   T.beam = beam
   track_child(T, "beam", beam)
   return beam
+end
+
+local function recreate_hum(T)
+  if T.hum and T.hum.valid then return T.hum end
+  local entity = T.entity
+  if not (entity and entity.valid) then return nil end
+  T.rescan = true
+  local hum = adopt_or_create(entity, HUM_NAME, false)
+  if not hum then T.children_dirty = true end
+  T.hum = hum
+  track_child(T, "hum", hum)
+  return hum
+end
+
+local function recreate_status_combinator(T)
+  if T.status_combinator and T.status_combinator.valid then return T.status_combinator end
+  local entity = T.entity
+  if not (entity and entity.valid) then return nil end
+  T.rescan = true
+  local combinator = adopt_or_create(entity, STATUS_COMBINATOR_NAME, false,
+    status_combinator_position(entity))
+  if not combinator then T.children_dirty = true end
+  T.status_combinator = combinator
+  track_child(T, "status", combinator)
+  -- the script wires follow the player's wiring and the broadcast is restored with them
+  refresh_status_wiring(T)
+  return combinator
+end
+
+-- the non-port children, in recreate order
+local RECREATORS = { recreate_beam, recreate_hum, recreate_status_combinator }
+
+-- keeps a unit-number list sorted on insert: the per-force registry stays sorted at
+-- all times, so the rationing scans and the drain order are deterministic without a
+-- per-tick sort
+local function register_in_list(list, unit_number)
+  local i = #list
+  while i >= 1 and list[i] > unit_number do
+    list[i + 1] = list[i]
+    i = i - 1
+  end
+  list[i + 1] = unit_number
 end
 
 local function register_transmitter(entity)
@@ -292,33 +536,6 @@ local function register_transmitter(entity)
   if storage.transmitters[unit_number] then return end
 
   local quality = entity.quality.name
-  -- adopt-or-create recovers untracked orphans left at the tile (a lost validity race
-  -- or a foreign record's teardown): creating fresh duplicates would let the rescan
-  -- pass destroy their banked energy instead of putting it back to work
-  local ports = {
-    import = adopt_or_create(entity, IMPORT_PORT_NAME),
-    export = adopt_or_create(entity, EXPORT_PORT_NAME),
-    upkeep = adopt_or_create(entity, upkeep_port_name(quality)),
-  }
-  -- prototype constants: reading electric_buffer_size crosses the C boundary, so the
-  -- per-tick code reads the cached values
-  local port_sizes = {}
-  local children_dirty = false
-  for _, key in ipairs(PORT_KEYS) do
-    local port = ports[key]
-    if port then
-      port_sizes[key] = port.electric_buffer_size
-    else
-      children_dirty = true -- a failed create: the retry scan runs on the next tick
-    end
-  end
-  local beam = adopt_or_create(entity, BEAM_NAME, false)
-  if beam then
-    beam.render_to_forces = "neutral"
-  else
-    children_dirty = true
-  end
-
   local T = {
     entity = entity,
     unit_number = unit_number,
@@ -326,9 +543,13 @@ local function register_transmitter(entity)
     force_name = entity.force.name,
     quality = quality,
     rate = upkeep_rate_per_tick(quality),
-    ports = ports,
-    port_sizes = port_sizes,
-    beam = beam,
+    ports = {},
+    port_sizes = {},
+    signal_state = SIGNAL_NONE,
+    enable_condition = nil,
+    wire_in = "both",
+    wire_out = "both",
+    disabled = false,
     beam_active = false,
     link_down = true,
     ever_linked = false,
@@ -337,20 +558,24 @@ local function register_transmitter(entity)
     upkeep_need = 0,
     machine_need = 0,
     machine_draw = 0,
-    import_pending = ports.import and ports.import.energy or 0,
+    import_pending = 0,
     demand = 0,
     rescan = true,
-    children_dirty = children_dirty,
+    children_dirty = false,
     child_regs = {},
-    retry_backoff = CREATE_BACKOFF_MIN,
     destroy_reg = script.register_on_object_destroyed(entity),
   }
+  -- the recreators adopt still-valid orphans left at the tile (a lost validity race
+  -- or a foreign record's teardown): creating fresh duplicates would let the rescan
+  -- pass destroy their banked energy instead of putting it back to work
+  for _, key in ipairs(PORT_KEYS) do
+    recreate_port(T, key)
+  end
+  for _, recreate in ipairs(RECREATORS) do
+    recreate(T)
+  end
   storage.destroy_regs[T.destroy_reg] = unit_number
   storage.transmitters[unit_number] = T
-  for _, key in ipairs(PORT_KEYS) do
-    track_child(T, key, ports[key])
-  end
-  track_child(T, "beam", beam)
   -- pools are keyed by force name; this index map resolves the name back when the
   -- force is merged away (on_forces_merged only reports the source index)
   storage.force_index_by_name[T.force_name] = T.force_index
@@ -359,7 +584,14 @@ local function register_transmitter(entity)
     list = {}
     storage.by_force[T.force_name] = list
   end
-  list[#list + 1] = unit_number
+  register_in_list(list, unit_number)
+  -- the entity's own tags restore its settings: the engine keeps them on
+  -- re-creations and entity clones (blueprint builds deliver theirs through the
+  -- build events, which run after registration and re-apply idempotently)
+  local tags = entity.tags
+  if tags then
+    apply_enable_settings(T, tags[ENABLE_CONDITION_TAG], tags[ENABLE_WIRE_IN_TAG], tags[ENABLE_WIRE_OUT_TAG])
+  end
   tick_handler_dirty = true
 end
 
@@ -382,14 +614,17 @@ local function return_exchange_energy(T)
   T.import_pending = 0
 end
 
--- keep_children: rebuild-only mode (on_configuration_changed) - the hidden ports and
--- the beam stay alive with their charges and register re-adopts them, so an update
--- drops no links (a network without own generation could never relink from the grid)
 local function unregister(T, keep_children)
   local entity_valid = (T.entity and T.entity.valid) and true or false
-  if not (keep_children and entity_valid) then
+  -- keep_children: rebuild-only mode (on_configuration_changed) - the hidden ports and
+  -- the beam stay alive with their charges and register re-adopts them, so an update
+  -- drops no links (a network without own generation could never relink from the grid)
+  local destroy_children = not (keep_children and entity_valid)
+  if destroy_children then
     return_exchange_energy(T)
     destroy_if_valid(T.beam)
+    destroy_if_valid(T.hum)
+    destroy_if_valid(T.status_combinator)
     local ports = T.ports
     if ports then
       for _, key in ipairs(PORT_KEYS) do
@@ -419,7 +654,7 @@ local function unregister(T, keep_children)
   end
   -- the pin must not outlive the record: on a force change the engine keeps the alert
   -- (the entity survives) and the old force's players would see it forever
-  if not (keep_children and entity_valid) then
+  if destroy_children then
     if entity_valid then
       T.entity.force.remove_alert({ type = ALERT_TYPE_CUSTOM, entity = T.entity })
     else
@@ -466,11 +701,20 @@ local function update_transmitter(T, tick)
       destroy_if_valid(old_port)
       T.quality = quality
       T.rate = upkeep_rate_per_tick(quality)
-      local new_port = recreate_port(T, "upkeep")
-      if new_port and reserve > 0 then
-        new_port.energy = math.min(reserve, T.port_sizes.upkeep or new_port.electric_buffer_size)
+      -- a disabled transmitter has no upkeep port by design: the tier swap takes
+      -- effect when it is enabled again (the recreate scan stays idle meanwhile)
+      if not T.disabled then
+        local new_port = recreate_port(T, "upkeep")
+        if new_port and reserve > 0 then
+          new_port.energy = math.min(reserve, T.port_sizes.upkeep)
+        end
       end
     end
+
+    -- keep the invisible script wires in sync with the player's wiring: they are
+    -- not serialized by the engine, and an unwired transmitter must have no circuit
+    -- network at all (so the native "Circuit connection" section stays away)
+    refresh_status_wiring(T)
   end
 
   -- missing ports and beam are recreated on a destruction report (children_dirty) or
@@ -481,24 +725,24 @@ local function update_transmitter(T, tick)
   if T.children_dirty
       or (T.retry_at and tick >= T.retry_at)
       or (not T.retry_at and phase_due) then
-    -- the report is being handled now: a failing recreate must back off, not spin
+    -- the report is being handled now: a failing recreate re-sets children_dirty so
+    -- this backs off instead of spinning every tick
     T.children_dirty = false
-    local failed = false
     for _, key in ipairs(PORT_KEYS) do
       local port = T.ports[key]
       if not (port and port.valid) then
-        if not recreate_port(T, key) then
-          failed = true
+        if key == "upkeep" and T.disabled then
+          -- deliberately removed while disabled: it stays away until re-enabled
+          T.ports[key] = nil
+        else
+          recreate_port(T, key)
         end
       end
     end
-    local beam = T.beam
-    if not (beam and beam.valid) then
-      if not recreate_beam(T) then
-        failed = true
-      end
+    for _, recreate in ipairs(RECREATORS) do
+      recreate(T)
     end
-    if failed then
+    if T.children_dirty then
       T.retry_backoff = math.min((T.retry_backoff or CREATE_BACKOFF_MIN) * 2, CREATE_BACKOFF_MAX)
       T.retry_at = tick + T.retry_backoff
     else
@@ -509,24 +753,63 @@ local function update_transmitter(T, tick)
 
   -- destroy orphan duplicate ports and beams (prototype migrations and lost-validity
   -- races leave them behind); only after a registration or a recreate - in steady
-  -- state this never runs. Orphans of a foreign force are not ours to destroy.
+  -- state this never runs. Orphans of a foreign force are not ours to destroy. The
+  -- status combinator lives at its own offset position, everything else at the center.
   if T.rescan then
     T.rescan = false
-    for name, current in pairs({
-      [IMPORT_PORT_NAME] = T.ports.import,
-      [EXPORT_PORT_NAME] = T.ports.export,
-      [upkeep_port_name(T.quality)] = T.ports.upkeep,
-      [BEAM_NAME] = T.beam,
-    }) do
+    for _, scan in ipairs({
+        { name = IMPORT_PORT_NAME, current = T.ports.import },
+        { name = EXPORT_PORT_NAME, current = T.ports.export },
+        { name = upkeep_port_name(T.quality), current = T.ports.upkeep },
+        { name = BEAM_NAME, current = T.beam },
+        { name = HUM_NAME, current = T.hum },
+        { name = STATUS_COMBINATOR_NAME, current = T.status_combinator,
+          position = status_combinator_position(entity) },
+      }) do
       for _, orphan in ipairs(entity.surface.find_entities_filtered({
-        name = name,
-        position = entity.position,
-        radius = 0.1,
-      })) do
-        if orphan.valid and orphan ~= current and orphan.force == entity.force then
+          name = scan.name,
+          position = scan.position or entity.position,
+          radius = 0.1,
+        })) do
+        if orphan.valid and orphan ~= scan.current and orphan.force == entity.force then
           orphan.destroy()
         end
       end
+    end
+  end
+
+  -- circuit "Enable if": a disabled transmitter holds no link and consumes nothing.
+  -- The upkeep port is REMOVED, not just unpaid - the engine would keep feeding its
+  -- buffer from the local grid at the full rate otherwise.
+  local disabled = not evaluate_enable_condition(T)
+  if disabled ~= T.disabled then
+    T.disabled = disabled
+    T.paid_ticks, T.starve_ticks = 0, 0
+    T.signal_state = SIGNAL_NONE
+    write_status_signal(T)
+    if disabled then
+      set_link(T, false) -- no link alert: turning it off is deliberate
+      T.upkeep_need, T.machine_need, T.demand = 0, 0, 0
+      destroy_if_valid(T.ports.upkeep)
+      T.ports.upkeep = nil
+      track_child(T, "upkeep", nil)
+    else
+      -- the recreate scan rebuilds the upkeep port; the link re-establishes by
+      -- paying the upkeep, like on a fresh transmitter
+      T.children_dirty = true
+      T.link_down = true
+    end
+  end
+
+  -- custom alerts are one-shot for the engine: viewing the target surface (a click on
+  -- the alert travels there) dismisses it. Vanilla-style, re-raise it every second
+  -- while the link is down so the pin does not get silenced for good. Runs before the
+  -- upkeep port check: a lost port must not silence the pin either.
+  if T.link_down and not T.disabled then
+    T.alert_refresh = (T.alert_refresh or 60) - 1
+    if T.alert_refresh <= 0 then
+      notify_link_dropped(T)
+      T.alert_refresh = 60
     end
   end
 
@@ -536,6 +819,11 @@ local function update_transmitter(T, tick)
     -- demand from an older tick cannot feed the rationing. The import baseline stays
     -- fresh: the grid may drain the buffer while it cannot be measured, and the next
     -- tick's draw must not read as a spike.
+    if not T.link_down then
+      -- the port is gone (a failed recreate or a hostile mod): the link cannot be
+      -- held - drop it instead of broadcasting a healthy link that pays nothing
+      set_link(T, false)
+    end
     T.demand = 0
     T.upkeep_need = 0
     T.machine_need = 0
@@ -572,15 +860,14 @@ local function update_transmitter(T, tick)
     T.starve_ticks = 0
   end
 
-  -- custom alerts are one-shot for the engine: viewing the target surface (a click on
-  -- the alert travels there) dismisses it. Vanilla-style, re-raise it every second
-  -- while the link is down so the pin does not get silenced for good.
-  if T.link_down then
-    T.alert_refresh = (T.alert_refresh or 60) - 1
-    if T.alert_refresh <= 0 then
-      notify_link_dropped(T)
-      T.alert_refresh = 60
-    end
+  -- circuit status: link up / about to drop (starving) / down (both signals
+  -- absent); written only on a state change, the engine broadcasts the
+  -- combinator's signals on its own
+  local signal_state = T.link_down and SIGNAL_NONE
+    or (consumed >= rate - 1 and SIGNAL_UP or SIGNAL_FAILING)
+  if signal_state ~= T.signal_state then
+    T.signal_state = signal_state
+    write_status_signal(T)
   end
 
   -- transformer ports (Power Overload style), working simultaneously:
@@ -692,15 +979,14 @@ local function ration_force(force_name)
 
   -- collect from donors whatever the bank cannot cover: drain linked export
   -- accumulators proportionally to the charge they hold, down to zero when needed
-  -- (the floor from the harvest above is dipped only on shortage). Deterministic
-  -- drain order matters only under scarcity, so the sort runs only then. Donor
+  -- (the floor from the harvest above is dipped only on shortage). The registry is
+  -- kept sorted by unit number, so the drain order is deterministic for free. Donor
   -- energies are read once: no engine update runs inside the tick, so the values
   -- cannot change between this scan and the drain.
   local remaining = total_demand - pool
   donor_count = 0
   local available = 0
   if remaining > 0 then
-    table.sort(all)
     for i = 1, #all do
       local T = transmitters[all[i]]
       if T and not T.link_down then
@@ -766,6 +1052,29 @@ end
 
 local function on_tick(event)
   if storage.selftest then finish_selftest(event.tick) end
+  -- the Enable-if panel of an open transmitter follows the wiring live: the script
+  -- wires (and with them the circuit network) lag the player's wires by up to a poll
+  -- period, so the panel visibility is re-checked while a window is open
+  if event.tick % 30 == 0 and next(storage.enable_guis) then
+    for player_index, state in pairs(storage.enable_guis) do
+      local player = game.get_player(player_index)
+      local T = state.unit_number and storage.transmitters[state.unit_number] or nil
+      if not (player and T and T.entity.valid) then
+        storage.enable_guis[player_index] = nil
+        if player then destroy_enable_gui(player) end
+      else
+        local wired = transmitter_is_wired(T.entity)
+        if state.shown ~= wired then
+          state.shown = wired
+          if wired then
+            build_enable_gui(player, T)
+          else
+            destroy_enable_gui(player)
+          end
+        end
+      end
+    end
+  end
   local transmitters = storage.transmitters
   -- backwards: update_transmitter may unregister its own record (self-removal from
   -- the list being iterated is safe in this direction)
@@ -808,6 +1117,355 @@ function update_tick_handler()
   end
 end
 
+-- circuit "Enable if" GUI: a small frame anchored to the right of the native
+-- accumulator window, holding the condition (signal, comparator, constant).
+local ENABLE_FRAME_NAME = "spt_enable_frame"
+
+-- the engine renders a "Circuit connection" section into the transmitter's own
+-- window once it is wired; it duplicates the mod's Enable-if panel, so hide it.
+-- Best effort: a silent no-op when the engine window is not exposed to Lua.
+local function hide_native_circuit_section(player)
+  pcall(function()
+    local window = player.gui.screen.accumulator_gui
+    if not window then return end
+    local function walk(element, depth)
+      if depth > 8 then return end
+      for _, child in ipairs(element.children) do
+        local ok, caption = pcall(function() return serpent.line(child.caption) end)
+        if ok and caption and string.find(caption, "circuit-connection", 1, true) then
+          child.visible = false
+        end
+        walk(child, depth + 1)
+      end
+    end
+    walk(window, 1)
+  end)
+end
+
+local function destroy_enable_gui(player)
+  local frame = player.gui.relative[ENABLE_FRAME_NAME]
+  if frame then frame.destroy() end
+end
+
+local function comparator_index(comparator)
+  for index, choice in ipairs(COMPARATOR_CHOICES) do
+    if choice == comparator then return index end
+  end
+  return 1
+end
+
+local function build_enable_gui(player, T)
+  destroy_enable_gui(player)
+  local tags = { unit_number = T.unit_number }
+  local function add(parent, def)
+    def.tags = tags
+    return parent.add(def)
+  end
+  local frame = add(player.gui.relative, {
+    type = "frame",
+    name = ENABLE_FRAME_NAME,
+    caption = { "spt-enable.title" },
+    anchor = {
+      gui = defines.relative_gui_type.accumulator_gui,
+      position = defines.relative_gui_position.right,
+    },
+  })
+  local flow = add(frame, { type = "flow", name = "spt_enable_flow", direction = "vertical" })
+  local row = add(flow, { type = "flow", name = "spt_enable_row", direction = "horizontal" })
+  local button = add(row, {
+    type = "choose-elem-button",
+    name = "spt_enable_signal",
+    elem_type = "signal",
+    tooltip = { "spt-enable.signal-tooltip" },
+  })
+  -- the icon only renders when the value is set after creation
+  if T.enable_condition then
+    button.elem_value = T.enable_condition.signal
+  end
+  add(row, {
+    type = "drop-down",
+    name = "spt_enable_comparator",
+    items = COMPARATOR_GLYPHS,
+    selected_index = T.enable_condition and comparator_index(T.enable_condition.comparator) or 1,
+    tooltip = { "spt-enable.comparator-tooltip" },
+  })
+  add(row, {
+    type = "textfield",
+    name = "spt_enable_constant",
+    numeric = true,
+    text = T.enable_condition and tostring(T.enable_condition.constant) or "0",
+    tooltip = { "spt-enable.constant-tooltip" },
+  })
+  local wire_row = add(flow, { type = "flow", name = "spt_enable_wire_row", direction = "horizontal" })
+  add(wire_row, { type = "label", name = "spt_enable_wire_in_label", caption = { "spt-enable.wire-in" },
+    tooltip = { "spt-enable.wire-in-tooltip" } })
+  add(wire_row, {
+    type = "drop-down",
+    name = "spt_enable_wire_in",
+    items = WIRE_ITEMS,
+    selected_index = WIRE_INDEX[T.wire_in],
+  })
+  add(wire_row, { type = "label", name = "spt_enable_wire_out_label", caption = { "spt-enable.wire-out" },
+    tooltip = { "spt-enable.wire-out-tooltip" } })
+  add(wire_row, {
+    type = "drop-down",
+    name = "spt_enable_wire_out",
+    items = WIRE_ITEMS,
+    selected_index = WIRE_INDEX[T.wire_out],
+  })
+  add(flow, {
+    type = "button",
+    name = "spt_enable_clear",
+    caption = { "spt-enable.clear" },
+    tooltip = { "spt-enable.clear-tooltip" },
+    enabled = T.enable_condition ~= nil,
+  })
+  hide_native_circuit_section(player)
+end
+
+script.on_event(defines.events.on_gui_opened, function(event)
+  local player = game.get_player(event.player_index)
+  if not player then return end
+  local entity = event.entity
+  local T = entity and entity.valid and entity.name == TRANSMITTER_NAME
+    and storage.transmitters[entity.unit_number] or nil
+  local state = storage.enable_guis[event.player_index] or {}
+  storage.enable_guis[event.player_index] = state
+  if not T then
+    -- opening anything else (or nothing) puts the stale frame away
+    state.unit_number, state.shown = nil, false
+    destroy_enable_gui(player)
+  else
+    state.unit_number = T.unit_number
+    if transmitter_is_wired(entity) then
+      state.shown = true
+      build_enable_gui(player, T)
+    else
+      -- an unwired transmitter shows no Enable-if panel (like the native section);
+      -- the tick poll builds it when the transmitter gets wired
+      state.shown = false
+      destroy_enable_gui(player)
+    end
+  end
+end)
+
+script.on_event(defines.events.on_gui_closed, function(event)
+  local player = game.get_player(event.player_index)
+  if player then destroy_enable_gui(player) end
+  storage.enable_guis[event.player_index] = nil
+end)
+
+-- the transmitter is resolved from the widget's tags: player.opened is not
+-- reliable while a choose-elem-button popup is on screen
+local function transmitter_from_tags(element)
+  local unit_number = element.tags.unit_number
+  local T = storage.transmitters[unit_number]
+  if T and T.entity and T.entity.valid then return T end
+  return nil
+end
+
+local function refresh_clear_button(player, T)
+  local frame = player.gui.relative[ENABLE_FRAME_NAME]
+  if frame then
+    frame.spt_enable_flow.spt_enable_clear.enabled = T.enable_condition ~= nil
+  end
+end
+
+-- the constant of the currently open panel (0 when empty/unfilled)
+local function field_constant(player)
+  local frame = player.gui.relative[ENABLE_FRAME_NAME]
+  if not frame then return 0 end
+  local field = frame.spt_enable_flow.spt_enable_row.spt_enable_constant
+  return field and tonumber(field.text) or 0
+end
+
+script.on_event(defines.events.on_gui_elem_changed, function(event)
+  if event.element.name ~= "spt_enable_signal" then return end
+  local player = game.get_player(event.player_index)
+  local T = transmitter_from_tags(event.element)
+  if not T then return end
+  local value = event.element.elem_value
+  if value then
+    -- quality is not part of the condition: compare the plain signal
+    local signal = { type = value.type or "item", name = value.name }
+    if T.enable_condition then
+      T.enable_condition.signal = signal
+    else
+      T.enable_condition = { signal = signal, comparator = ">", constant = field_constant(player) }
+    end
+  else
+    T.enable_condition = nil -- no signal picked: the transmitter stays always enabled
+  end
+  -- the button renders the picked signal itself; just wake the clear button up
+  refresh_clear_button(player, T)
+end)
+
+script.on_event(defines.events.on_gui_selection_state_changed, function(event)
+  if event.element.name == "spt_enable_wire_in" or event.element.name == "spt_enable_wire_out" then
+    local T = transmitter_from_tags(event.element)
+    if not T then return end
+    local choice = WIRE_CHOICES[event.element.selected_index]
+    if event.element.name == "spt_enable_wire_in" then
+      T.wire_in = choice
+    else
+      T.wire_out = choice
+    end
+    refresh_status_wiring(T)
+    return
+  end
+  if event.element.name ~= "spt_enable_comparator" then return end
+  local player = game.get_player(event.player_index)
+  local T = transmitter_from_tags(event.element)
+  if not T then return end
+  local comparator = COMPARATOR_CHOICES[event.element.selected_index]
+  local constant = field_constant(player)
+  if not T.enable_condition then
+    -- a comparator picked before a signal: fall back to the plain virtual zero
+    T.enable_condition = {
+      signal = { type = "virtual", name = "signal-grey" },
+      comparator = comparator,
+      constant = constant,
+    }
+  else
+    T.enable_condition.comparator = comparator
+  end
+end)
+
+script.on_event(defines.events.on_gui_text_changed, function(event)
+  if event.element.name ~= "spt_enable_constant" then return end
+  local T = transmitter_from_tags(event.element)
+  if not T then return end
+  local constant = tonumber(event.element.text) or 0
+  if T.enable_condition then
+    T.enable_condition.constant = constant
+  end
+end)
+
+script.on_event(defines.events.on_gui_click, function(event)
+  if event.element.name ~= "spt_enable_clear" then return end
+  local T = transmitter_from_tags(event.element)
+  if not T then return end
+  T.enable_condition = nil
+  local player = game.get_player(event.player_index)
+  if player then build_enable_gui(player, T) end
+end)
+
+-- applies a condition table from tags/paste; returns false for anything malformed
+local function set_enable_condition_from_table(T, condition)
+  if type(condition) ~= "table" then return false end
+  local signal = condition.signal
+  local comparator = condition.comparator
+  if type(signal) ~= "table" or type(signal.name) ~= "string"
+      or (signal.type ~= nil and type(signal.type) ~= "string")
+      or not COMPARATOR_FUNCTIONS[comparator] or type(condition.constant) ~= "number" then
+    return false
+  end
+  T.enable_condition = {
+    signal = { type = signal.type or "item", name = signal.name },
+    comparator = comparator,
+    constant = condition.constant,
+  }
+  return true
+end
+
+-- applies a full settings snapshot; a nil condition clears it
+function apply_enable_settings(T, condition, wire_in, wire_out)
+  T.enable_condition = nil
+  set_enable_condition_from_table(T, condition)
+  T.wire_in = wire_choice(wire_in) or "both"
+  T.wire_out = wire_choice(wire_out) or "both"
+  -- a restored control behavior must not leave read_charge on (the mod never uses it)
+  local behavior = T.entity and T.entity.valid and T.entity.get_control_behavior() or nil
+  if behavior and behavior.read_charge then behavior.read_charge = false end
+  refresh_status_wiring(T)
+end
+
+script.on_event(defines.events.on_entity_settings_pasted, function(event)
+  local source = event.source
+  local destination = event.destination
+  if not (source and source.valid and destination and destination.valid) then return end
+  if source.name ~= TRANSMITTER_NAME or destination.name ~= TRANSMITTER_NAME then return end
+  local source_T = storage.transmitters[source.unit_number]
+  local destination_T = storage.transmitters[destination.unit_number]
+  if not destination_T then return end
+  destination_T.enable_condition = copy_condition(source_T and source_T.enable_condition)
+  destination_T.wire_in = source_T and source_T.wire_in or "both"
+  destination_T.wire_out = source_T and source_T.wire_out or "both"
+  -- wire_out may have changed: the script wires follow immediately, not on the poll
+  refresh_status_wiring(destination_T)
+end)
+
+-- the event does not carry the blueprint item; it is resolved from the player the
+-- same way for regular blueprints, the library and book pages
+local function resolve_blueprint_from_player(player)
+  if player.blueprint_to_setup and player.blueprint_to_setup.valid_for_read then
+    return player.blueprint_to_setup
+  end
+  if player.cursor_stack and player.cursor_stack.valid_for_read and player.cursor_stack.is_blueprint then
+    return player.cursor_stack
+  end
+  return nil
+end
+
+script.on_event(defines.events.on_player_setup_blueprint, function(event)
+  local player = game.get_player(event.player_index)
+  if not player then return end
+  local blueprint = resolve_blueprint_from_player(player)
+  if not (blueprint and blueprint.is_blueprint_setup()) then return end
+  local ok, entities = pcall(function() return blueprint.get_blueprint_entities() end)
+  if not ok or not entities then return end
+  local ok_mapping, mapping = pcall(function() return event.mapping.get() end)
+  if not ok_mapping then return end
+  for _, blueprint_entity in ipairs(entities) do
+    if blueprint_entity.name == TRANSMITTER_NAME then
+      local source = mapping[blueprint_entity.entity_number]
+      if source and source.valid then
+        local T = storage.transmitters[source.unit_number]
+        -- blueprinting over ghosts: no placed record exists, the ghost itself carries
+        -- the tags of the blueprint it was placed from
+        local ghost_tags = (not T) and source.tags or nil
+        local condition = (T and copy_condition(T.enable_condition))
+          or (ghost_tags and copy_condition(ghost_tags[ENABLE_CONDITION_TAG])) or nil
+        local wire_in = (T and T.wire_in)
+          or (ghost_tags and wire_choice(ghost_tags[ENABLE_WIRE_IN_TAG])) or "both"
+        local wire_out = (T and T.wire_out)
+          or (ghost_tags and wire_choice(ghost_tags[ENABLE_WIRE_OUT_TAG])) or "both"
+        blueprint.set_blueprint_entity_tags(blueprint_entity.entity_number, {
+          [ENABLE_CONDITION_TAG] = condition,
+          [ENABLE_WIRE_IN_TAG] = wire_in,
+          [ENABLE_WIRE_OUT_TAG] = wire_out,
+        })
+      end
+    end
+  end
+end)
+
+-- built transmitters pick the condition and the wire choices back up from their
+-- blueprint tags
+local function on_transmitter_built(event)
+  local entity = event.entity or event.created_entity
+  if not (entity and entity.valid and entity.name == TRANSMITTER_NAME) then return end
+  local T = storage.transmitters[entity.unit_number]
+  if not T then return end
+  -- when a robot (or the player) completes a ghost, the ghost's tags arrive on the
+  -- EVENT; entity.tags is nil for entities built without a blueprint. Absent tag
+  -- keys mean the defaults (no condition, both wires).
+  local tags = event.tags or entity.tags
+  if not tags then return end
+  apply_enable_settings(T, tags[ENABLE_CONDITION_TAG], tags[ENABLE_WIRE_IN_TAG], tags[ENABLE_WIRE_OUT_TAG])
+end
+
+-- the handler itself checks the entity name, no event filters needed
+for _, event_id in ipairs({
+  defines.events.on_built_entity,
+  defines.events.on_robot_built_entity,
+  defines.events.on_space_platform_built_entity,
+  defines.events.script_raised_built,
+  defines.events.script_raised_revive,
+}) do
+  script.on_event(event_id, on_transmitter_built)
+end
+
 local function rescan()
   for _, surface in pairs(game.surfaces) do
     for _, entity in ipairs(surface.find_entities_filtered({ name = TRANSMITTER_NAME })) do
@@ -846,9 +1504,10 @@ script.on_configuration_changed(function()
       paid_ticks = T.paid_ticks or 0,
       starve_ticks = T.starve_ticks or 0,
       machine_draw = T.machine_draw or 0,
+      enable_condition = copy_condition(T.enable_condition),
+      wire_in = T.wire_in or "both",
+      wire_out = T.wire_out or "both",
     }
-  end
-  for _, T in pairs(storage.transmitters) do
     unregister(T, true)
   end
   rescan()
@@ -856,6 +1515,9 @@ script.on_configuration_changed(function()
     local T = storage.transmitters[unit_number]
     if T then
       T.machine_draw = snap.machine_draw
+      T.enable_condition = snap.enable_condition
+      T.wire_in = snap.wire_in
+      T.wire_out = snap.wire_out
       if not snap.link_down and T.link_down then
         set_link(T, true) -- re-lights the beam and clears the pin
       end
@@ -931,7 +1593,7 @@ script.on_event(defines.events.on_entity_cloned, function(event)
   -- buffer energy is a duplication artifact and must not enter the pool) and let
   -- register_transmitter create a fresh set
   local surface = entity.surface
-  for _, name in ipairs({ BEAM_NAME, IMPORT_PORT_NAME, EXPORT_PORT_NAME, upkeep_port_name(entity.quality.name) }) do
+  for _, name in ipairs({ BEAM_NAME, HUM_NAME, IMPORT_PORT_NAME, EXPORT_PORT_NAME, STATUS_COMBINATOR_NAME, upkeep_port_name(entity.quality.name) }) do
     for _, orphan in ipairs(surface.find_entities_filtered({ name = name, position = entity.position, radius = 0.1 })) do
       if orphan.valid then orphan.destroy() end
     end
@@ -983,6 +1645,8 @@ remote.add_interface("space-power-transmitter", {
       link_down = T.link_down,
       ever_linked = T.ever_linked,
       demand = T.demand,
+      disabled = T.disabled or false,
+      signal_state = T.signal_state and SIGNAL_NAME[T.signal_state] or nil,
       upkeep_buffer = T.ports.upkeep and T.ports.upkeep.valid and T.ports.upkeep.energy or nil,
       import_buffer = T.ports.import and T.ports.import.valid and T.ports.import.energy or nil,
       export_buffer = T.ports.export and T.ports.export.valid and T.ports.export.energy or nil,
@@ -1011,5 +1675,26 @@ remote.add_interface("space-power-transmitter", {
     if type(force_name) ~= "string" or type(value) ~= "number" then return false end
     storage.pools[force_name] = math.max(value, 0)
     return true
+  end,
+  set_enable_condition = function(unit_number, condition)
+    local T = storage.transmitters[unit_number]
+    if not T then return false end
+    if condition == nil then
+      T.enable_condition = nil
+    elseif not set_enable_condition_from_table(T, condition) then
+      return false
+    end
+    -- keep entity.tags in step: engine re-creations and ghost tags read them
+    return true
+  end,
+  get_enable_condition = function(unit_number)
+    local T = storage.transmitters[unit_number]
+    if not T or not T.enable_condition then return nil end
+    return copy_condition(T.enable_condition)
+  end,
+  get_enable_wires = function(unit_number)
+    local T = storage.transmitters[unit_number]
+    if not T then return nil end
+    return { wire_in = T.wire_in, wire_out = T.wire_out }
   end,
 })
