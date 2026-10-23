@@ -1229,23 +1229,22 @@ script.on_event(defines.events.on_gui_opened, function(event)
   local entity = event.entity
   local T = entity and entity.valid and entity.name == TRANSMITTER_NAME
     and storage.transmitters[entity.unit_number] or nil
-  local state = storage.enable_guis[event.player_index] or {}
-  storage.enable_guis[event.player_index] = state
   if not T then
     -- opening anything else (or nothing) puts the stale frame away
-    state.unit_number, state.shown = nil, false
+    storage.enable_guis[event.player_index] = nil
     destroy_enable_gui(player)
+    return
+  end
+  local state = { unit_number = T.unit_number }
+  storage.enable_guis[event.player_index] = state
+  if transmitter_is_wired(entity) then
+    state.shown = true
+    build_enable_gui(player, T)
   else
-    state.unit_number = T.unit_number
-    if transmitter_is_wired(entity) then
-      state.shown = true
-      build_enable_gui(player, T)
-    else
-      -- an unwired transmitter shows no Enable-if panel (like the native section);
-      -- the tick poll builds it when the transmitter gets wired
-      state.shown = false
-      destroy_enable_gui(player)
-    end
+    -- an unwired transmitter shows no Enable-if panel (like the native section);
+    -- the tick poll builds it when the transmitter gets wired
+    state.shown = false
+    destroy_enable_gui(player)
   end
 end)
 
@@ -1492,6 +1491,9 @@ script.on_configuration_changed(function()
   -- (child_regs, force_index_by_name): on_init does not re-run for it
   init_storage()
   verify_upkeep_prototypes()
+  -- a mod reload closes every window: no Enable-if panel is open, the stale shown
+  -- flags would only mislead the tick poll
+  storage.enable_guis = {}
   -- an update must not drop links: the hidden ports and the beam are kept alive with
   -- their charges (register re-adopts them), and the link state is carried over - a
   -- network without own generation could never relink from the grid alone. Old-format
