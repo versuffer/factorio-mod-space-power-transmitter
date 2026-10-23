@@ -1482,6 +1482,10 @@ script.on_init(function()
 end)
 
 script.on_load(function()
+  -- a save made by an older build of the mod lacks the newest storage fields (dev
+  -- iterations without a version bump get neither on_init nor on_configuration_
+  -- changed): the lazy init is idempotent and keeps every entry point covered
+  init_storage()
   -- restore the dynamic tick handler according to the stored state
   update_tick_handler()
 end)
