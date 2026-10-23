@@ -1054,8 +1054,9 @@ local function on_tick(event)
   if storage.selftest then finish_selftest(event.tick) end
   -- the Enable-if panel of an open transmitter follows the wiring live: the script
   -- wires (and with them the circuit network) lag the player's wires by up to a poll
-  -- period, so the panel visibility is re-checked while a window is open
-  if event.tick % 30 == 0 and next(storage.enable_guis) then
+  -- period, so the panel visibility is re-checked while a window is open. The field
+  -- is absent in saves made by older builds (on_load may not create it)
+  if event.tick % 30 == 0 and storage.enable_guis and next(storage.enable_guis) then
     for player_index, state in pairs(storage.enable_guis) do
       local player = game.get_player(player_index)
       local T = state.unit_number and storage.transmitters[state.unit_number] or nil
@@ -1110,7 +1111,7 @@ end
 -- is refreshed once per event.
 function update_tick_handler()
   tick_handler_dirty = false
-  if next(storage.transmitters) or storage.selftest then
+  if (storage.transmitters and next(storage.transmitters)) or storage.selftest then
     script.on_event(defines.events.on_tick, on_tick)
   else
     script.on_event(defines.events.on_tick, nil)
@@ -1231,12 +1232,16 @@ script.on_event(defines.events.on_gui_opened, function(event)
     and storage.transmitters[entity.unit_number] or nil
   if not T then
     -- opening anything else (or nothing) puts the stale frame away
-    storage.enable_guis[event.player_index] = nil
+    if storage.enable_guis then storage.enable_guis[event.player_index] = nil end
     destroy_enable_gui(player)
     return
   end
+  -- lazy init: saves made by older builds lack the field, and on_load may not
+  -- create it (the engine rejects any storage change there)
+  local guis = storage.enable_guis or {}
+  storage.enable_guis = guis
   local state = { unit_number = T.unit_number }
-  storage.enable_guis[event.player_index] = state
+  guis[event.player_index] = state
   if transmitter_is_wired(entity) then
     state.shown = true
     build_enable_gui(player, T)
@@ -1251,7 +1256,7 @@ end)
 script.on_event(defines.events.on_gui_closed, function(event)
   local player = game.get_player(event.player_index)
   if player then destroy_enable_gui(player) end
-  storage.enable_guis[event.player_index] = nil
+  if storage.enable_guis then storage.enable_guis[event.player_index] = nil end
 end)
 
 -- the transmitter is resolved from the widget's tags: player.opened is not
@@ -1482,11 +1487,9 @@ script.on_init(function()
 end)
 
 script.on_load(function()
-  -- a save made by an older build of the mod lacks the newest storage fields (dev
-  -- iterations without a version bump get neither on_init nor on_configuration_
-  -- changed): the lazy init is idempotent and keeps every entry point covered
-  init_storage()
-  -- restore the dynamic tick handler according to the stored state
+  -- restore the dynamic tick handler according to the stored state. storage must NOT
+  -- be modified here (the engine CRC-checks it around on_load and rejects any change);
+  -- fields added by newer builds are initialized lazily at their access sites instead
   update_tick_handler()
 end)
 
