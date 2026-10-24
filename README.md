@@ -1,5 +1,7 @@
 ## Space Power Transmitter
 
+![Space Power Transmitter](images/transmitter.gif)
+
 Adds Space Power Transmitter that links any planet or space platform - even a moving one - to the common space power grid: bidirectional energy transfer through space over any distance, rationed by demand. Draws a constant upkeep to hold the link (600 MW by default, less at higher quality); the link drops if the local network cannot supply it and restores automatically once it can. Can be unlocked on Aquilo.
 
 ## New technologies
