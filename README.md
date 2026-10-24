@@ -55,4 +55,4 @@ The graphics are taken from the [Orbital Interlink](https://mods.factorio.com/mo
 
 ## Contacts
 
-Would be glad to get suggestions for further mod improvements, bugfixes, etc. on my GitHub.
+Would be glad to get suggestions for further mod improvements, bugfixes, etc. on my GitHub: [factorio-mod-space-power-transmitter](https://github.com/versuffer/factorio-mod-space-power-transmitter).
