@@ -37,6 +37,10 @@ local function upkeep_port(surface, position)
   })[1]
 end
 
+local function destroy_if_valid(entity)
+  if entity and entity.valid then entity.destroy() end
+end
+
 local function read_signals(entity, connector)
   local network = entity.get_circuit_network(connector)
   local values = {}
@@ -70,6 +74,17 @@ local resumed = false
 
 script.on_load(function()
   resumed = true
+  say("on_load: phase=" .. tostring(storage.test_state and storage.test_state.phase))
+end)
+
+-- a changed mod set (the harness adds a dummy mod before run 3) fires this: switch
+-- the phase machine to the config-change assertions
+script.on_configuration_changed(function()
+  local state = storage.test_state
+  say("on_configuration_changed: phase=" .. tostring(state and state.phase))
+  if state and state.phase == "done2" then
+    state.phase, state.phase_start = "config", nil
+  end
 end)
 
 script.on_init(function()
@@ -98,6 +113,10 @@ script.on_event(defines.events.on_tick, function(event)
     end
     if not state.resumed_tick then state.resumed_tick = tick end
     if tick - state.resumed_tick < 70 then return end
+    -- keep paying the upkeep: the link must be UP when this session's save (the
+    -- config-change run's input) is written at shutdown
+    local upkeep = upkeep_port(transmitter.surface, transmitter.position)
+    if upkeep then upkeep.energy = upkeep.electric_buffer_size end
     local comb = transmitter.surface.find_entities_filtered({
       name = "spt-status-combinator", position = transmitter.position, radius = 0.1, limit = 1 })[1]
     if comb then
@@ -110,9 +129,48 @@ script.on_event(defines.events.on_tick, function(event)
     if info.signal_state then expected[info.signal_state] = 1 end
     check(state, "persisted transmitter (save/load)", transmitter, RED, expected)
     say("PERSIST RESULT: " .. (state.failures == 0 and "PASS" or ("FAIL (" .. state.failures .. " failures)")))
+    -- markers for the config-change run: the next session (a modified mod set) runs
+    -- on_configuration_changed and must carry the settings and the link over. The
+    -- constant 0 keeps the condition TRUE on an empty network (the driver
+    -- combinator's slot does not reliably survive save/load), so the link lives.
+    remote.call("space-power-transmitter", "set_enable_condition", transmitter.unit_number,
+      { signal = { type = "virtual", name = "signal-green" }, comparator = ">=", constant = 0 })
+    remote.call("space-power-transmitter", "set_enable_wires", transmitter.unit_number, "red", "green")
     state.phase = "done2"
     return
-  elseif state.phase == "done2" or state.phase == "done" then
+  elseif state.phase == "config" then
+    -- the previous session set the markers and saved; a changed mod set fires
+    -- on_configuration_changed and the mod must carry the settings and the link over
+    if not state.config_start then state.config_start = tick end
+    -- keep the upkeep paid: the restored link must survive, not re-starve
+    local upkeep = upkeep_port(transmitter.surface, transmitter.position)
+    if upkeep then upkeep.energy = upkeep.electric_buffer_size end
+    if tick - state.config_start < 130 then return end
+    local cond = remote.call("space-power-transmitter", "get_enable_condition", transmitter.unit_number)
+    local wires = remote.call("space-power-transmitter", "get_enable_wires", transmitter.unit_number)
+    local cond_ok = cond and cond.comparator == ">=" and cond.constant == 0
+      and cond.signal.name == "signal-green" and cond.signal.type == "virtual"
+    local wires_ok = wires and wires.wire_in == "red" and wires.wire_out == "green"
+    if cond_ok and wires_ok then
+      say("PASS configuration change kept the settings")
+    else
+      state.failures = state.failures + 1
+      say("FAIL config change: cond=" .. serpent.line(cond) .. " wires=" .. serpent.line(wires))
+    end
+    -- the status broadcast rides wire_out = green now
+    check(state, "configuration change kept the link", transmitter, GREEN, { ["spt-link-up"] = 1 })
+    local network = transmitter.get_circuit_network(RED)
+    local sg = network and network.get_signal({ type = "virtual", name = "signal-green" })
+    say("config net: network=" .. tostring(network ~= nil) .. " signal-green=" .. tostring(sg))
+    local info = remote.call("space-power-transmitter", "transmitter_info", transmitter.unit_number)
+    say("config diagnostics: " .. serpent.line(info))
+    say("config debug: " .. tostring(remote.call("space-power-transmitter", "debug_info", transmitter.unit_number)))
+    say("config signals red: " .. serpent.line(read_signals(transmitter, RED))
+      .. " green: " .. serpent.line(read_signals(transmitter, GREEN)))
+    say("CONFIG RESULT: " .. (state.failures == 0 and "PASS" or ("FAIL (" .. state.failures .. " failures)")))
+    state.phase = "done3"
+    return
+  elseif state.phase == "done3" or state.phase == "done2" then
     return
   end
 
@@ -370,6 +428,117 @@ script.on_event(defines.events.on_tick, function(event)
     elseif t == 8 then
       state.tagged.destroy() -- unregisters itself
       state.tagged = nil
+      state.phase, state.phase_start = "crash", tick
+    end
+
+  elseif phase == "crash" then
+    -- torture: every malformed input and hostile action must be rejected or recovered
+    -- from, never crash the game
+    if t == 1 then
+      local count0 = remote.call("space-power-transmitter", "transmitter_count")
+      state.count0 = count0
+      -- 1) garbage build tags: the build handler validates, never applies, never crashes
+      local surface = transmitter.surface
+      local victim = surface.create_entity({
+        name = TRANSMITTER, position = { 40, 0 }, force = "player" })
+      state.crash_victim = victim
+      script.raise_script_built({ entity = victim, tags = { [ENABLE_CONDITION_TAG] = "garbage" } })
+      script.raise_script_built({ entity = victim, tags = { [ENABLE_CONDITION_TAG] = { signal = 42 } } })
+      script.raise_script_built({ entity = victim, tags = { [ENABLE_CONDITION_TAG] =
+        { signal = { type = "virtual", name = "signal-green" }, comparator = "~", constant = "x" } } })
+      script.raise_script_built({ entity = victim, tags =
+        { spt_enable_wire_in = "purple", spt_enable_wire_out = 7 } })
+      if remote.call("space-power-transmitter", "get_enable_condition", victim.unit_number) == nil then
+        say("PASS garbage build tags rejected")
+      else
+        state.failures = state.failures + 1
+        say("FAIL: garbage build tags were applied")
+      end
+      -- 2) garbage remote calls: rejected with false/nil, no crash
+      local ok1 = remote.call("space-power-transmitter", "set_enable_condition", 999999,
+        { signal = { type = "virtual", name = "signal-green" }, comparator = ">", constant = 1 })
+      local ok2 = remote.call("space-power-transmitter", "set_enable_condition", victim.unit_number,
+        { signal = { name = "signal-green" }, comparator = "??", constant = 1 })
+      local ok3 = remote.call("space-power-transmitter", "set_pool", 42, "x")
+      if ok1 == false and ok2 == false and ok3 == false then
+        say("PASS garbage remote calls rejected")
+      else
+        state.failures = state.failures + 1
+        say(string.format("FAIL garbage remote calls: %s %s %s",
+          tostring(ok1), tostring(ok2), tostring(ok3)))
+      end
+    elseif t == 5 then
+      local victim = state.crash_victim
+      local wires = remote.call("space-power-transmitter", "get_enable_wires", victim.unit_number)
+      if wires and wires.wire_in == "both" and wires.wire_out == "both" then
+        say("PASS garbage wire tags fall back to defaults")
+      else
+        state.failures = state.failures + 1
+        say("FAIL garbage wire fallback: " .. serpent.line(wires))
+      end
+      local count = remote.call("space-power-transmitter", "transmitter_count")
+      if count == state.count0 + 1 then
+        say("PASS garbage-tagged transmitter registered")
+      else
+        state.failures = state.failures + 1
+        say("FAIL garbage-tagged transmitter count: " .. tostring(count))
+      end
+    elseif t == 6 then
+      -- 3) deleting a surface with a transmitter on it: the record cleans up, the
+      -- port energy is refunded, no crash
+      local temp = game.create_surface("spt-crash-test", { width = 64, height = 64 })
+      local pos = temp.find_non_colliding_position(TRANSMITTER, { 0, 0 }, 100, 2) or { 0, 0 }
+      local stranded = temp.create_entity({ name = TRANSMITTER, position = pos, force = "player" })
+      state.stranded_ok = stranded ~= nil
+      if not stranded then say("note: the temp-surface transmitter could not be created") end
+    elseif t == 8 then
+      local temp = game.surfaces["spt-crash-test"]
+      if temp then game.delete_surface(temp) end
+    elseif t == 12 then
+      local count = remote.call("space-power-transmitter", "transmitter_count")
+      if state.stranded_ok == false or count == state.count0 + 1 then
+        say("PASS surface deletion cleaned the record")
+      else
+        state.failures = state.failures + 1
+        say("FAIL surface deletion count: " .. tostring(count) .. " want " .. tostring(state.count0 + 1))
+      end
+      -- 4) a force merge under the transmitter: the record must rebuild
+      local second = game.create_force("spt-second")
+      local surface = transmitter.surface
+      local merged = surface.create_entity({
+        name = TRANSMITTER, position = { 50, 0 }, force = second })
+      state.merged = merged
+      local pole = surface.create_entity({ name = "substation", position = { 56, 0 }, force = second })
+      merged.get_wire_connector(RED, true).connect_to(
+        pole.get_wire_connector(RED, true), false, defines.wire_origin.player)
+    elseif t == 16 then
+      local count = remote.call("space-power-transmitter", "transmitter_count")
+      if count == state.count0 + 2 then
+        say("PASS second-force transmitter registered")
+      else
+        state.failures = state.failures + 1
+        say("FAIL second-force count: " .. tostring(count) .. " want " .. tostring(state.count0 + 2))
+      end
+      game.merge_forces("spt-second", "player")
+    elseif t == 20 then
+      -- the record rebuild (a staggered phase check) destroys and recreates the
+      -- ports: find the upkeep port fresh every tick
+      if not state.merged then state.phase, state.phase_start = "forcebuild", tick end
+    elseif t > 20 and t < 170 and state.merged then
+      local upkeep = upkeep_port(transmitter.surface, state.merged.position)
+      if upkeep then upkeep.energy = upkeep.electric_buffer_size end
+    elseif t >= 170 then
+      -- the force change rebuilds the record (a staggered phase check), then the link
+      -- re-establishes after 60 paid ticks
+      if read_signals(state.merged, RED)["spt-link-up"] == 1 then
+        say("PASS force merge rebuilt the record, link re-established")
+      else
+        state.failures = state.failures + 1
+        say("FAIL force merge recovery: " .. serpent.line(read_signals(state.merged, RED)))
+      end
+      destroy_if_valid(state.crash_victim)
+      destroy_if_valid(state.merged)
+      state.crash_victim, state.merged = nil, nil
       state.phase, state.phase_start = "forcebuild", tick
     end
 
@@ -398,19 +567,23 @@ script.on_event(defines.events.on_tick, function(event)
       script.raise_script_built({ entity = fresh })
       say("force-build: " .. tostring(old_un) .. " -> " .. tostring(fresh.unit_number)
         .. " created_tags=" .. serpent.line(fresh.tags))
-    elseif t == 12 then
-      -- hostile-mod simulation: destroy two hidden children; the destruction report
-      -- must recreate them (the upkeep port back with its cached buffer size). The
-      -- destroy waits a few ticks: a force build leaves the fresh record's adopted
-      -- children dead for several ticks until the recreation scan catches up.
+    elseif t >= 12 and t < 60 and not state.children_destroyed then
+      -- hostile-mod simulation: once the force-built record has stable children,
+      -- destroy two of them; the destruction reports must recreate them (the upkeep
+      -- port back with its cached buffer size)
       local surface = transmitter.surface
       local upkeep = surface.find_entities_filtered({
         name = UPKEEP_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
       local import = surface.find_entities_filtered({
         name = "spt-import-port", position = transmitter.position, radius = 0.1, limit = 1 })[1]
-      if upkeep then upkeep.destroy() end
-      if import then import.destroy() end
-    elseif t == 16 and not state.checked_children then
+      if upkeep and import then
+        upkeep.destroy()
+        import.destroy()
+        state.children_destroyed = tick
+      end
+    elseif state.children_destroyed
+        and tick - state.children_destroyed >= 30
+        and not state.checked_children then
       state.checked_children = true
       local surface = transmitter.surface
       local upkeep = surface.find_entities_filtered({

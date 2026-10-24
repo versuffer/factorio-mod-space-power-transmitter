@@ -28,6 +28,7 @@ WORK="$(mktemp -d /tmp/spt-test.XXXXXX)"
 FACTORIO="${FACTORIO:-$HOME/Library/Application Support/Steam/steamapps/common/Factorio/factorio.app/Contents/MacOS/factorio}"
 RUN1_SECONDS="${RUN1_SECONDS:-30}"
 RUN2_SECONDS="${RUN2_SECONDS:-15}"
+RUN3_SECONDS="${RUN3_SECONDS:-15}"
 
 fail() {
   echo "FAIL: $*"
@@ -83,8 +84,12 @@ run_server() {
 trap 'pkill -9 -f "start-server $WORK/test.zip" 2>/dev/null' EXIT
 
 echo "== data stage"
-pgrep -fl -i factorio > /dev/null \
-  && fail "another Factorio instance is running (it holds the application-support lock)"
+# the running game holds the application-support lock; an isolated --config write-data
+# (see ALLOW_RUNNING_GAME) does not touch it, so the guard can be opted out
+if [ "${ALLOW_RUNNING_GAME:-0}" != "1" ]; then
+  pgrep -fl -i factorio > /dev/null \
+    && fail "another Factorio instance is running (it holds the application-support lock)"
+fi
 "$FACTORIO" --create "$WORK/test.zip" --mod-directory "$WORK/mods" > "$WORK/create.log" 2>&1 \
   || fail "data stage crashed (see $WORK/create.log)"
 grep -iE "error while" "$WORK/create.log" > /dev/null \
@@ -102,5 +107,16 @@ run_server "$RUN2_SECONDS" > "$WORK/run2.txt"
 cat "$WORK/run2.txt"
 grep -q "PERSIST RESULT: PASS" "$WORK/run2.txt" || fail "run 2 (see $WORK/server.log)"
 grep -q "FAIL" "$WORK/run2.txt" && fail "run 2 had FAIL lines"
+
+echo "== run 3: on_configuration_changed (mod version change)"
+# replace the symlink with a copy and bump the version in the copy: a version change
+# fires on_configuration_changed for the mod (the repo's info.json is not touched)
+rm "$WORK/mods/space-power-transmitter"
+cp -R "$MOD" "$WORK/mods/space-power-transmitter"
+sed -i '' 's/"version": "1.2.0"/"version": "1.2.1"/' "$WORK/mods/space-power-transmitter/info.json"
+run_server "$RUN3_SECONDS" > "$WORK/run3.txt"
+cat "$WORK/run3.txt"
+grep -q "CONFIG RESULT: PASS" "$WORK/run3.txt" || fail "run 3 (see $WORK/server.log)"
+grep -q "FAIL" "$WORK/run3.txt" && fail "run 3 had FAIL lines"
 
 echo "ALL TESTS PASSED (artifacts in $WORK)"

@@ -1494,6 +1494,7 @@ script.on_load(function()
 end)
 
 script.on_configuration_changed(function()
+  log("[spt] on_configuration_changed fired")
   -- a save initialized by an older version lacks the newest storage fields
   -- (child_regs, force_index_by_name): on_init does not re-run for it
   init_storage()
@@ -1705,5 +1706,16 @@ remote.add_interface("space-power-transmitter", {
     local T = storage.transmitters[unit_number]
     if not T then return nil end
     return { wire_in = T.wire_in, wire_out = T.wire_out }
+  end,
+  set_enable_wires = function(unit_number, wire_in, wire_out)
+    local T = storage.transmitters[unit_number]
+    if not T then return false end
+    local in_choice = wire_choice(wire_in)
+    local out_choice = wire_choice(wire_out)
+    if not in_choice or not out_choice then return false end
+    T.wire_in = in_choice
+    T.wire_out = out_choice
+    refresh_status_wiring(T)
+    return true
   end,
 })
