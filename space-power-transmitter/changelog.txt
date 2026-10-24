@@ -1,15 +1,11 @@
 ---------------------------------------------------------------------------------------------------
 Version: 1.2.0
-Date: 23. 10. 2026
+Date: 24. 10. 2026
   Features:
-  - The transmitter can be wired into a circuit network and broadcasts its link status as virtual signals: spt-link-up (healthy link) and spt-link-failing (the local network stopped paying the upkeep - the link drops within seconds); both signals absent means the link is down.
-  - Circuit "Enable if" condition (a small panel next to the transmitter's window, also available through the remote interface): while it is false the transmitter is off - no link, no upkeep drain, no link-lost alert. The condition transfers with the copy-paste tool and in blueprints.
-  - The panel has a Wire selector (Both / Red / Green): it picks the wire color that carries the status signals and is watched by the Enable if condition.
-  - The hidden status combinator sits offset from the transmitter, so it no longer blocks super force build (ctrl+shift+click) of transmitter blueprints over the existing entity.
-  - The transmitter now has a circuit connector (the accumulator socket); the status signals ride on both wire colors via an invisible script-wired combinator.
-  - The transmitter's own (meaningless) accumulator charge signal is suppressed on the circuit network.
-  Bugfixes:
-  - The status signal survived saving and loading: script wires and the combinator slot are rebuilt on session start (script wires are not serialized by the engine).
+  - The transmitter can be wired into a circuit network and broadcasts its link status as virtual signals: spt-link-up (healthy link) and spt-link-failing (the upkeep is not being paid - the link drops within seconds); both signals absent means the link is down.
+  - Circuit "Enable if" condition (a small panel next to the transmitter's window): while it is false the transmitter is off - no link, no upkeep drain.
+  - The wire color carrying the status signals and the wire color watched by the condition are selectable (Both / Red / Green).
+  - The condition and the wire choices transfer with the copy-paste tool and in blueprints.
 ---------------------------------------------------------------------------------------------------
 Version: 1.1.0
 Date: 18. 10. 2026

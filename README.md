@@ -17,6 +17,8 @@ Adds Space Power Transmitter that links any planet or space platform - even a mo
     -   Energy is rationed proportionally to demand when production falls short (upkeep first, machines second);
     -   Draws a constant upkeep to hold the link (600 MW by default; uncommon, rare, epic and legendary quality draw 5/6, 4/6, 3/6 and 1/6 of that value);
     -   If the local network cannot supply the upkeep, the link drops (a custom alert with a map pin is raised); it recovers from local generation only and relinks automatically once enough power is available again;
+    -   Can be wired into a circuit network: broadcasts its link status as virtual signals - `spt-link-up` is 1 while the link is healthy, `spt-link-failing` is 1 while the upkeep is not being paid (the link drops within seconds), and both absent means the link is down;
+    -   Supports a circuit "Enable if" condition (panel beside the transmitter's window): while it is false the transmitter is off - no link, no upkeep drain; the condition transfers with the copy-paste tool and in blueprints;
     -   Weighs one ton: exactly one transmitter fits per rocket;
 
 ## Additional features
@@ -28,9 +30,13 @@ Adds Space Power Transmitter that links any planet or space platform - even a mo
 
 ## Existing saves
 
--   Mod does not change vanilla entity or item properties;
--   Safe to add to an existing save; removing the mod drops all links (banked energy is not refunded);
--   Mod is mostly safe for using with existing save but it is ***STRONGLY RECOMMENDED*** to make backup before installing ***OR*** updating mod version;
+- Mod does not change vanilla entity or item properties;
+- Safe to add to an existing save; removing the mod drops all links (banked energy is not refunded);
+- Mod is mostly safe for using with existing save but it is ***STRONGLY RECOMMENDED*** to make backup before installing ***OR*** updating mod version;
+
+## Development
+
+- `tests/run.sh` - headless end-to-end tests of the circuit features (link status signals, Enable if, save/load rebuild); see `tests/README.md`.
 
 ## Compatibility
 

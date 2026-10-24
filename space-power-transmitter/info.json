@@ -3,7 +3,7 @@
   "version": "1.2.0",
   "title": "Space Power Transmitter",
   "author": "versuffer",
-  "description": "Adds Space Power Transmitter that links any planet or space platform - even a moving one - to the common space power grid: bidirectional energy transfer through space over any distance, rationed by demand. Draws a constant upkeep to hold the link (600 MW by default, less at higher quality); the link drops if the local network cannot supply it and restores automatically once it can. Wired into a circuit network, the transmitter broadcasts its link status (virtual signals: link up, link failing; both absent = link down) and supports an Enable if condition that switches it off entirely (no link, no upkeep drain). Unlocked with Cryogenic science (researchable on Aquilo).",
+  "description": "Links any planet or space platform (even a moving one) to a shared space power grid: energy flows both ways over any distance, rationed by demand. Holding the link costs a constant upkeep (600 MW by default, less at higher quality); without enough local power the link drops and reconnects automatically. Wired to a circuit network, the transmitter broadcasts its link status and supports an Enable if condition. Unlocked with Cryogenic science.",
   "factorio_version": "2.1",
   "space_travel_required": true,
   "dependencies": [

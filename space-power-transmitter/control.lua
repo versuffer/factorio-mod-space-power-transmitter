@@ -3,7 +3,6 @@ local BEAM_NAME = "spt-beam"
 local HUM_NAME = "spt-hum"
 local IMPORT_PORT_NAME = "spt-import-port"
 local EXPORT_PORT_NAME = "spt-export-port"
-local UPKEEP_PORT_PREFIX = "spt-upkeep-port-"
 local STATUS_COMBINATOR_NAME = "spt-status-combinator"
 
 local RELINK_PAID_TICKS = 60
@@ -48,8 +47,10 @@ local WIRE_CONNECTOR_IDS = {
 
 -- dropdown rows in the Enable-if GUI, same keys as the CONNECTORS table
 local WIRE_CHOICES = { "both", "red", "green" }
-local WIRE_INDEX = { both = 1, red = 2, green = 3 }
 local WIRE_ITEMS = { { "spt-enable.wire-both" }, { "spt-enable.wire-red" }, { "spt-enable.wire-green" } }
+-- inverse lookup: O(1) validation of a choice read back from tags/paste
+local WIRE_INDEX = {}
+for index, choice in ipairs(WIRE_CHOICES) do WIRE_INDEX[choice] = index end
 
 -- validates a wire choice read back from tags/paste: anything else means "absent"
 local function wire_choice(value)
@@ -77,6 +78,9 @@ local COMPARATOR_FUNCTIONS = {
   ["="] = function(value, constant) return value == constant end,
   ["≠"] = function(value, constant) return value ~= constant end,
 }
+-- reverse lookup of the GUI row for a comparator read back from tags/paste
+local COMPARATOR_INDEX = {}
+for index, choice in ipairs(COMPARATOR_CHOICES) do COMPARATOR_INDEX[choice] = index end
 
 -- transmitters awaiting re-registration after a force change: the registry is
 -- being iterated on this tick, so the rebuild waits for the pass to finish
@@ -88,6 +92,9 @@ local tick_handler_dirty = false
 
 local power = require("__space-power-transmitter__.common.power")
 local BASE_UPKEEP = power.upkeep_watts()
+-- the same builder the data stage uses for the port prototypes (common/power.lua
+-- is shared by both stages)
+local upkeep_port_name = power.upkeep_port_name
 
 -- forward declaration: defined after on_tick
 local update_tick_handler
@@ -96,13 +103,13 @@ local update_tick_handler
 -- the entity's own tags (engine re-creations and clones carry them)
 local apply_enable_settings
 
+-- forward declarations: defined in the Enable-if GUI section, but on_tick's GUI poll
+-- calls them - a local defined later would not be in scope there
+local destroy_enable_gui
+local build_enable_gui
+
 local function upkeep_rate_per_tick(quality)
   return BASE_UPKEEP * (power.QUALITY_MULTIPLIERS[quality] or 1) / 60
-end
-
--- unknown quality tiers (from other mods) fall back to the normal upkeep port prototype
-local function upkeep_port_name(quality)
-  return UPKEEP_PORT_PREFIX .. (power.QUALITY_MULTIPLIERS[quality] and quality or "normal")
 end
 
 -- Load-time verification: the whole upkeep mechanic relies on the engine applying an
@@ -117,7 +124,7 @@ local SELFTEST_TICKS = 3
 
 local function verify_upkeep_prototypes()
   for quality, multiplier in pairs(power.QUALITY_MULTIPLIERS) do
-    local name = UPKEEP_PORT_PREFIX .. quality
+    local name = upkeep_port_name(quality)
     local prototype = prototypes.entity[name]
     local source = prototype and prototype.electric_energy_source_prototype
     local expected_buffer = BASE_UPKEEP * multiplier / 30
@@ -350,6 +357,19 @@ local function copy_condition(condition)
   }
 end
 
+-- keeps entity.tags in step with the record: force-change re-registrations and
+-- engine re-creations restore the settings from them. Merges into the existing
+-- tags: foreign keys (other mods) must survive.
+local function sync_tags(T)
+  local entity = T.entity
+  if not (entity and entity.valid) then return end
+  local tags = entity.tags or {}
+  tags[ENABLE_CONDITION_TAG] = T.enable_condition and copy_condition(T.enable_condition) or nil
+  tags[ENABLE_WIRE_IN_TAG] = T.wire_in
+  tags[ENABLE_WIRE_OUT_TAG] = T.wire_out
+  entity.tags = tags
+end
+
 -- the enable condition reads the signal from both wire colors (vanilla machines
 -- sum them too); no condition means always enabled
 local function evaluate_enable_condition(T)
@@ -423,7 +443,7 @@ local function adopt_or_create(entity, name, create_smoke, position)
       position = position,
       radius = 0.1,
     })) do
-    if orphan.valid and orphan.force == entity.force then
+    if orphan.force == entity.force then
       if not found then
         found = orphan
       else
@@ -473,51 +493,38 @@ local function recreate_port(T, key)
   return port
 end
 
-local function recreate_beam(T)
-  if T.beam and T.beam.valid then return T.beam end
+-- the non-port children, in recreate order: the tracking key, the record field, the
+-- entity name, an optional position callback, and a post-create hook. The combinator
+-- restores its script wiring (and with it the status broadcast) after adoption.
+local CHILDREN = {
+  { key = "beam", field = "beam", name = BEAM_NAME,
+    after = function(T, beam) beam.render_to_forces = T.beam_active and {} or "neutral" end },
+  { key = "hum", field = "hum", name = HUM_NAME },
+  { key = "status", field = "status_combinator", name = STATUS_COMBINATOR_NAME,
+    position = status_combinator_position, after = refresh_status_wiring },
+}
+
+-- Recreate a lost non-port child: returns the still-valid child, adopts a valid
+-- orphan left at the tile, or creates a fresh entity (nil when the create failed -
+-- a failed recreate sets children_dirty so the caller backs off). A recreate flags
+-- the tile for the duplicate scan.
+local function recreate_child(T, child)
+  local current = T[child.field]
+  if current and current.valid then return current end
   local entity = T.entity
   if not (entity and entity.valid) then return nil end
   T.rescan = true
-  local beam = adopt_or_create(entity, BEAM_NAME, false)
-  if beam then
-    beam.render_to_forces = T.beam_active and {} or "neutral"
-  else
+  local created = adopt_or_create(entity, child.name, false,
+    child.position and child.position(entity) or nil)
+  T[child.field] = created
+  track_child(T, child.key, created)
+  if not created then
     T.children_dirty = true
+  elseif child.after then
+    child.after(T, created)
   end
-  T.beam = beam
-  track_child(T, "beam", beam)
-  return beam
+  return created
 end
-
-local function recreate_hum(T)
-  if T.hum and T.hum.valid then return T.hum end
-  local entity = T.entity
-  if not (entity and entity.valid) then return nil end
-  T.rescan = true
-  local hum = adopt_or_create(entity, HUM_NAME, false)
-  if not hum then T.children_dirty = true end
-  T.hum = hum
-  track_child(T, "hum", hum)
-  return hum
-end
-
-local function recreate_status_combinator(T)
-  if T.status_combinator and T.status_combinator.valid then return T.status_combinator end
-  local entity = T.entity
-  if not (entity and entity.valid) then return nil end
-  T.rescan = true
-  local combinator = adopt_or_create(entity, STATUS_COMBINATOR_NAME, false,
-    status_combinator_position(entity))
-  if not combinator then T.children_dirty = true end
-  T.status_combinator = combinator
-  track_child(T, "status", combinator)
-  -- the script wires follow the player's wiring and the broadcast is restored with them
-  refresh_status_wiring(T)
-  return combinator
-end
-
--- the non-port children, in recreate order
-local RECREATORS = { recreate_beam, recreate_hum, recreate_status_combinator }
 
 -- keeps a unit-number list sorted on insert: the per-force registry stays sorted at
 -- all times, so the rationing scans and the drain order are deterministic without a
@@ -546,7 +553,6 @@ local function register_transmitter(entity)
     ports = {},
     port_sizes = {},
     signal_state = SIGNAL_NONE,
-    enable_condition = nil,
     wire_in = "both",
     wire_out = "both",
     disabled = false,
@@ -559,7 +565,6 @@ local function register_transmitter(entity)
     machine_need = 0,
     machine_draw = 0,
     import_pending = 0,
-    demand = 0,
     rescan = true,
     children_dirty = false,
     child_regs = {},
@@ -571,8 +576,8 @@ local function register_transmitter(entity)
   for _, key in ipairs(PORT_KEYS) do
     recreate_port(T, key)
   end
-  for _, recreate in ipairs(RECREATORS) do
-    recreate(T)
+  for _, child in ipairs(CHILDREN) do
+    recreate_child(T, child)
   end
   storage.destroy_regs[T.destroy_reg] = unit_number
   storage.transmitters[unit_number] = T
@@ -739,8 +744,8 @@ local function update_transmitter(T, tick)
         end
       end
     end
-    for _, recreate in ipairs(RECREATORS) do
-      recreate(T)
+    for _, child in ipairs(CHILDREN) do
+      recreate_child(T, child)
     end
     if T.children_dirty then
       T.retry_backoff = math.min((T.retry_backoff or CREATE_BACKOFF_MIN) * 2, CREATE_BACKOFF_MAX)
@@ -771,7 +776,7 @@ local function update_transmitter(T, tick)
           position = scan.position or entity.position,
           radius = 0.1,
         })) do
-        if orphan.valid and orphan ~= scan.current and orphan.force == entity.force then
+        if orphan ~= scan.current and orphan.force == entity.force then
           orphan.destroy()
         end
       end
@@ -789,7 +794,6 @@ local function update_transmitter(T, tick)
     write_status_signal(T)
     if disabled then
       set_link(T, false) -- no link alert: turning it off is deliberate
-      T.upkeep_need, T.machine_need, T.demand = 0, 0, 0
       destroy_if_valid(T.ports.upkeep)
       T.ports.upkeep = nil
       track_child(T, "upkeep", nil)
@@ -824,7 +828,6 @@ local function update_transmitter(T, tick)
       -- held - drop it instead of broadcasting a healthy link that pays nothing
       set_link(T, false)
     end
-    T.demand = 0
     T.upkeep_need = 0
     T.machine_need = 0
     local import_port = T.ports.import
@@ -877,7 +880,6 @@ local function update_transmitter(T, tick)
   --                                   draws on deficit
   T.upkeep_need = 0
   T.machine_need = 0
-  T.demand = 0
   local import_port = T.ports.import
   if import_port and import_port.valid then
     local energy = import_port.energy
@@ -904,7 +906,6 @@ local function update_transmitter(T, tick)
       local need = math.max(0, target - energy)
       T.upkeep_need = math.min(need, math.max(0, rate * 2 - energy)) -- cushion part first
       T.machine_need = need - T.upkeep_need                          -- machine part second
-      T.demand = math.max(0, rate - consumed) + T.upkeep_need + T.machine_need
     end
   end
 end
@@ -1143,19 +1144,12 @@ local function hide_native_circuit_section(player)
   end)
 end
 
-local function destroy_enable_gui(player)
+function destroy_enable_gui(player)
   local frame = player.gui.relative[ENABLE_FRAME_NAME]
   if frame then frame.destroy() end
 end
 
-local function comparator_index(comparator)
-  for index, choice in ipairs(COMPARATOR_CHOICES) do
-    if choice == comparator then return index end
-  end
-  return 1
-end
-
-local function build_enable_gui(player, T)
+function build_enable_gui(player, T)
   destroy_enable_gui(player)
   local tags = { unit_number = T.unit_number }
   local function add(parent, def)
@@ -1187,7 +1181,7 @@ local function build_enable_gui(player, T)
     type = "drop-down",
     name = "spt_enable_comparator",
     items = COMPARATOR_GLYPHS,
-    selected_index = T.enable_condition and comparator_index(T.enable_condition.comparator) or 1,
+    selected_index = T.enable_condition and COMPARATOR_INDEX[T.enable_condition.comparator] or 1,
     tooltip = { "spt-enable.comparator-tooltip" },
   })
   add(row, {
@@ -1300,6 +1294,7 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
   else
     T.enable_condition = nil -- no signal picked: the transmitter stays always enabled
   end
+  sync_tags(T)
   -- the button renders the picked signal itself; just wake the clear button up
   refresh_clear_button(player, T)
 end)
@@ -1315,6 +1310,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
       T.wire_out = choice
     end
     refresh_status_wiring(T)
+    sync_tags(T)
     return
   end
   if event.element.name ~= "spt_enable_comparator" then return end
@@ -1333,6 +1329,7 @@ script.on_event(defines.events.on_gui_selection_state_changed, function(event)
   else
     T.enable_condition.comparator = comparator
   end
+  sync_tags(T)
 end)
 
 script.on_event(defines.events.on_gui_text_changed, function(event)
@@ -1342,6 +1339,7 @@ script.on_event(defines.events.on_gui_text_changed, function(event)
   local constant = tonumber(event.element.text) or 0
   if T.enable_condition then
     T.enable_condition.constant = constant
+    sync_tags(T)
   end
 end)
 
@@ -1350,6 +1348,7 @@ script.on_event(defines.events.on_gui_click, function(event)
   local T = transmitter_from_tags(event.element)
   if not T then return end
   T.enable_condition = nil
+  sync_tags(T)
   local player = game.get_player(event.player_index)
   if player then build_enable_gui(player, T) end
 end)
@@ -1382,6 +1381,7 @@ function apply_enable_settings(T, condition, wire_in, wire_out)
   local behavior = T.entity and T.entity.valid and T.entity.get_control_behavior() or nil
   if behavior and behavior.read_charge then behavior.read_charge = false end
   refresh_status_wiring(T)
+  sync_tags(T)
 end
 
 script.on_event(defines.events.on_entity_settings_pasted, function(event)
@@ -1392,11 +1392,8 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
   local source_T = storage.transmitters[source.unit_number]
   local destination_T = storage.transmitters[destination.unit_number]
   if not destination_T then return end
-  destination_T.enable_condition = copy_condition(source_T and source_T.enable_condition)
-  destination_T.wire_in = source_T and source_T.wire_in or "both"
-  destination_T.wire_out = source_T and source_T.wire_out or "both"
-  -- wire_out may have changed: the script wires follow immediately, not on the poll
-  refresh_status_wiring(destination_T)
+  apply_enable_settings(destination_T,
+    source_T and source_T.enable_condition, source_T and source_T.wire_in, source_T and source_T.wire_out)
 end)
 
 -- the event does not carry the blueprint item; it is resolved from the player the
@@ -1494,7 +1491,6 @@ script.on_load(function()
 end)
 
 script.on_configuration_changed(function()
-  log("[spt] on_configuration_changed fired")
   -- a save initialized by an older version lacks the newest storage fields
   -- (child_regs, force_index_by_name): on_init does not re-run for it
   init_storage()
@@ -1520,8 +1516,7 @@ script.on_configuration_changed(function()
     }
     unregister(T, true)
   end
-  rescan()
-  for unit_number, snap in pairs(snapshots) do
+  rescan()  for unit_number, snap in pairs(snapshots) do
     local T = storage.transmitters[unit_number]
     if T then
       T.machine_draw = snap.machine_draw
@@ -1605,7 +1600,7 @@ script.on_event(defines.events.on_entity_cloned, function(event)
   local surface = entity.surface
   for _, name in ipairs({ BEAM_NAME, HUM_NAME, IMPORT_PORT_NAME, EXPORT_PORT_NAME, STATUS_COMBINATOR_NAME, upkeep_port_name(entity.quality.name) }) do
     for _, orphan in ipairs(surface.find_entities_filtered({ name = name, position = entity.position, radius = 0.1 })) do
-      if orphan.valid then orphan.destroy() end
+      orphan.destroy()
     end
   end
   register_transmitter(entity)
@@ -1654,7 +1649,7 @@ remote.add_interface("space-power-transmitter", {
     return {
       link_down = T.link_down,
       ever_linked = T.ever_linked,
-      demand = T.demand,
+      demand = (T.upkeep_need or 0) + (T.machine_need or 0),
       disabled = T.disabled or false,
       signal_state = T.signal_state and SIGNAL_NAME[T.signal_state] or nil,
       upkeep_buffer = T.ports.upkeep and T.ports.upkeep.valid and T.ports.upkeep.energy or nil,
@@ -1676,7 +1671,7 @@ remote.add_interface("space-power-transmitter", {
     return string.format(
       "T un=%d force=%s q=%s link_down=%s needs=(%s,%s) demand=%s | import[%s] | export[%s] | upkeep[%s] | entity=%s",
       T.unit_number, tostring(T.force_name), tostring(T.quality), tostring(T.link_down),
-      tostring(T.upkeep_need), tostring(T.machine_need), tostring(T.demand),
+      tostring(T.upkeep_need), tostring(T.machine_need), tostring(T.upkeep_need + T.machine_need),
       port_info(T.ports and T.ports.import), port_info(T.ports and T.ports.export),
       port_info(T.ports and T.ports.upkeep),
       T.entity and T.entity.valid and (T.entity.surface.name .. " " .. T.entity.position.x .. "," .. T.entity.position.y) or "invalid")
@@ -1694,7 +1689,8 @@ remote.add_interface("space-power-transmitter", {
     elseif not set_enable_condition_from_table(T, condition) then
       return false
     end
-    -- keep entity.tags in step: engine re-creations and ghost tags read them
+    -- keep entity.tags in step: engine re-creations read them back
+    sync_tags(T)
     return true
   end,
   get_enable_condition = function(unit_number)
@@ -1716,6 +1712,7 @@ remote.add_interface("space-power-transmitter", {
     T.wire_in = in_choice
     T.wire_out = out_choice
     refresh_status_wiring(T)
+    sync_tags(T)
     return true
   end,
 })

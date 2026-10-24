@@ -6,9 +6,18 @@ require("circuit-connector-sprites")
 
 local upkeep_watts = power.upkeep_watts()
 
-local function upkeep_port_name(quality)
-  return "spt-upkeep-port-" .. quality
-end
+-- common flags of every hidden companion entity (ports, beam, hum, combinator)
+local HIDDEN_FLAGS = {
+  "not-on-map",
+  "not-blueprintable",
+  "not-deconstructable",
+  "hide-alt-info",
+  "not-flammable",
+  "not-repairable",
+  "not-upgradable",
+  "no-copy-paste",
+  "placeable-off-grid",
+}
 
 local transmitter_picture = {
   layers = {
@@ -42,57 +51,53 @@ local transmitter_picture = {
 -- Both sheets (24 frames) come from tools/make_beam_animation.py and
 -- tools/make_glow_flicker.py; layers share one clock: the first layer's
 -- animation_speed drives all of them (1 s cycle at 0.4).
-local function beam_anim()
-  return {
-    {
-      layers = {
-        {
-          filenames = {
-            "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-1.png",
-            "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-2.png",
-            "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-3.png",
-            "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-4.png",
-          },
-          lines_per_file = 1,
-          width = 500,
-          height = 4077,
-          frame_count = 24,
-          line_length = 6,
-          animation_speed = 0.4,
-          scale = 0.5,
-          -- printed by tools/make_beam_animation.py: the ring stays pinned to the
-          -- structure while the column reaches 3x as high
-          shift = util.by_pixel(42, -951),
-          draw_as_glow = true,
-          blend_mode = "additive",
+local beam_animation = {
+  {
+    layers = {
+      {
+        filenames = {
+          "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-1.png",
+          "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-2.png",
+          "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-3.png",
+          "__space-power-transmitter__/graphics/entity/transmitter-beam-anim-4.png",
         },
-        {
-          -- flicker overlay, modular-nuclear-reactor style: a plain additive
-          -- draw_as_glow layer whose brightness pulse is baked into the frames
-          -- (tools/make_glow_flicker.py). No draw_as_light here - nested light
-          -- passes get dropped, glow is the flag proven to render in this entity.
-          filenames = {
-            "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-1.png",
-            "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-2.png",
-            "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-3.png",
-            "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-4.png",
-          },
-          lines_per_file = 1,
-          width = 500,
-          height = 364,
-          frame_count = 24,
-          line_length = 6,
-          scale = 0.5,
-          shift = util.by_pixel(42, -21),
-          draw_as_glow = true,
-          blend_mode = "additive",
+        lines_per_file = 1,
+        width = 500,
+        height = 4077,
+        frame_count = 24,
+        line_length = 6,
+        animation_speed = 0.4,
+        scale = 0.5,
+        -- printed by tools/make_beam_animation.py: the ring stays pinned to the
+        -- structure while the column reaches 3x as high
+        shift = util.by_pixel(42, -951),
+        draw_as_glow = true,
+        blend_mode = "additive",
+      },
+      {
+        -- flicker overlay, modular-nuclear-reactor style: a plain additive
+        -- draw_as_glow layer whose brightness pulse is baked into the frames
+        -- (tools/make_glow_flicker.py). No draw_as_light here - nested light
+        -- passes get dropped, glow is the flag proven to render in this entity.
+        filenames = {
+          "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-1.png",
+          "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-2.png",
+          "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-3.png",
+          "__space-power-transmitter__/graphics/entity/transmitter-glow-flicker-4.png",
         },
+        lines_per_file = 1,
+        width = 500,
+        height = 364,
+        frame_count = 24,
+        line_length = 6,
+        scale = 0.5,
+        shift = util.by_pixel(42, -21),
+        draw_as_glow = true,
+        blend_mode = "additive",
       },
     },
-  }
-end
-
-local beam_animation = beam_anim()
+  },
+}
 
 local function power_str(value)
   return string.format("%.3fJ", value)
@@ -120,17 +125,7 @@ local function make_port(name, usage_priority, buffer_joules, input_watts, outpu
       { icon = "__space-power-transmitter__/graphics/icons/space-power-transmitter.png", icon_size = 64 },
     },
     hidden = true,
-    flags = {
-      "not-on-map",
-      "not-blueprintable",
-      "not-deconstructable",
-      "hide-alt-info",
-      "not-flammable",
-      "not-repairable",
-      "not-upgradable",
-      "no-copy-paste",
-      "placeable-off-grid",
-    },
+    flags = HIDDEN_FLAGS,
     collision_mask = { layers = {} },
     selectable = false,
     energy_source = energy_source,
@@ -144,7 +139,7 @@ local function make_upkeep_port(quality)
   -- never draws more than its buffer space, so this keeps the demand at exactly the
   -- rate without exceeding 1x consumption. The outage tolerance is time-based
   -- hysteresis in control.lua, not an energy reserve.
-  return make_port(upkeep_port_name(quality), "primary-input", watts / 30, watts / 60, 0, "port-upkeep")
+  return make_port(power.upkeep_port_name(quality), "primary-input", watts / 30, watts / 60, 0, "port-upkeep")
 end
 
 local entities = {
@@ -196,17 +191,7 @@ local entities = {
     render_layer = "light-effect",
     selectable = false,
     random_animation_offset = true,
-    flags = {
-      "not-on-map",
-      "not-blueprintable",
-      "not-deconstructable",
-      "hide-alt-info",
-      "not-flammable",
-      "not-repairable",
-      "not-upgradable",
-      "no-copy-paste",
-      "placeable-off-grid",
-    },
+    flags = HIDDEN_FLAGS,
     -- no collision: a default collision box here blocks super force build of
     -- transmitter blueprints over the existing entity
     collision_mask = { layers = {} },
@@ -224,17 +209,7 @@ local entities = {
     icon = "__space-power-transmitter__/graphics/icons/space-power-transmitter.png",
     icon_size = 64,
     hidden = true,
-    flags = {
-      "not-on-map",
-      "not-blueprintable",
-      "not-deconstructable",
-      "hide-alt-info",
-      "not-flammable",
-      "not-repairable",
-      "not-upgradable",
-      "no-copy-paste",
-      "placeable-off-grid",
-    },
+    flags = HIDDEN_FLAGS,
     collision_mask = { layers = {} },
     selectable = false,
     max_health = 100,
@@ -281,17 +256,7 @@ local entities = {
     name = "spt-status-combinator",
     localised_name = { "entity-name.space-power-transmitter" },
     hidden = true,
-    flags = {
-      "not-on-map",
-      "not-blueprintable",
-      "not-deconstructable",
-      "hide-alt-info",
-      "not-flammable",
-      "not-repairable",
-      "not-upgradable",
-      "no-copy-paste",
-      "placeable-off-grid",
-    },
+    flags = HIDDEN_FLAGS,
     collision_mask = { layers = {} },
     selectable = false,
     max_health = 100,
@@ -342,17 +307,7 @@ local entities = {
       { icon = "__space-power-transmitter__/graphics/icons/space-power-transmitter.png", icon_size = 64 },
     },
     hidden = true,
-    flags = {
-      "not-on-map",
-      "not-blueprintable",
-      "not-deconstructable",
-      "hide-alt-info",
-      "not-flammable",
-      "not-repairable",
-      "not-upgradable",
-      "no-copy-paste",
-      "placeable-off-grid",
-    },
+    flags = HIDDEN_FLAGS,
     collision_mask = { layers = {} },
     selectable = false,
     max_health = 100,

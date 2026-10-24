@@ -11,6 +11,13 @@ M.QUALITY_MULTIPLIERS = {
   ["legendary"] = 1 / 6,
 }
 
+-- the hidden upkeep port prototypes are per-quality tiers; unknown quality tiers
+-- (from other mods) fall back to the normal one
+M.UPKEEP_PORT_PREFIX = "spt-upkeep-port-"
+function M.upkeep_port_name(quality)
+  return M.UPKEEP_PORT_PREFIX .. (M.QUALITY_MULTIPLIERS[quality] and quality or "normal")
+end
+
 -- the setting is given in kilowatts; the game UI enforces the same bounds
 M.MIN_UPKEEP_KW = 6000
 M.MAX_UPKEEP_KW = 1000000
