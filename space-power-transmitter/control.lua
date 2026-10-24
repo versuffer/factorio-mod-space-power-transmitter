@@ -2,7 +2,7 @@ local TRANSMITTER_NAME = "space-power-transmitter"
 local BEAM_NAME = "spt-beam"
 local HUM_NAME = "spt-hum"
 local IMPORT_PORT_NAME = "spt-import-port"
-local EXPORT_PORT_NAME = "spt-export-port"
+local EXPORT_PORT_NAME = "spt-export-interface"
 local STATUS_COMBINATOR_NAME = "spt-status-combinator"
 
 local RELINK_PAID_TICKS = 60
@@ -155,6 +155,25 @@ local function verify_upkeep_prototypes()
         .. "' does not match the shared power module (flow " .. tostring(actual_flow)
         .. " vs " .. expected_flow .. ") - a conflicting mod may have overridden it")
     end
+  end
+end
+
+-- The export port must be the dynamic-priority electric-energy-interface added in 1.3.0:
+-- the whole transformer design rides on the engine treating dynamic buffers like
+-- accumulators, and the point of 1.3.0 is that the port adds no phantom battery capacity
+-- to the network.
+local function verify_export_port_prototype()
+  local prototype = prototypes.entity[EXPORT_PORT_NAME]
+  local source = prototype and prototype.type == "electric-energy-interface"
+    and prototype.electric_energy_source_prototype or nil
+  local priority = source and source.usage_priority or nil
+  if not (source and priority == "dynamic"
+      and math.abs(source.buffer_capacity - 1e9) < 1) then
+    error("space-power-transmitter: the export port prototype '" .. EXPORT_PORT_NAME
+      .. "' is not the expected dynamic-priority electric-energy-interface (type "
+      .. tostring(prototype and prototype.type) .. ", priority " .. tostring(priority)
+      .. ", buffer " .. tostring(source and source.buffer_capacity)
+      .. ") - a conflicting mod may have overridden it")
   end
 end
 
@@ -888,7 +907,8 @@ local function update_transmitter(T, tick)
     if energy < pending then
       drew = pending - energy
     end
-    T.import_pending = energy
+    -- T.import_pending is NOT refreshed here: the end-of-tick baseline capture (in
+    -- ration_force) runs after the ration refill and is authoritative
     -- the machine draw estimate (what the grid drew from the import buffer minus the
     -- upkeep share actually paid): smoothed with an exponential average, sub-joule
     -- noise snapped to zero so the idle exit engages
@@ -949,6 +969,22 @@ local function ration_force(force_name)
   local transmitters = storage.transmitters
   local pool = storage.pools[force_name] or 0
 
+  -- the import baseline must be captured AFTER the ration refill: the next
+  -- update then reads drew = refilled_level - post_drain_level = the grid's
+  -- actual draw. A pre-refill baseline reads 0 in steady state (the grid fully
+  -- drains whatever was injected), machine_need never grows, and the pool only
+  -- ever funds the upkeep cushion - found by tests/loadtest.sh. Runs here once
+  -- per force (not as a second full-registry pass in on_tick).
+  local function capture_baselines()
+    for i = 1, #all do
+      local T = transmitters[all[i]]
+      local import_port = T and T.ports and T.ports.import
+      if import_port and import_port.valid then
+        T.import_pending = import_port.energy
+      end
+    end
+  end
+
   -- service list: LINKED transmitters only (a surface that cannot pay its own upkeep
   -- is not part of the grid and receives nothing from the pool - it recovers from
   -- local generation and its own reserve; its residual import buffer drains to the
@@ -976,7 +1012,11 @@ local function ration_force(force_name)
   local total_demand = tier1_total + tier2_total
 
   -- fully idle: nothing to distribute and nothing to collect - skip the rest
-  if total_demand == 0 and pool == 0 then return end
+  -- (no injection this tick either, so the baselines do not move)
+  if total_demand == 0 and pool == 0 then
+    capture_baselines()
+    return
+  end
 
   -- collect from donors whatever the bank cannot cover: drain linked export
   -- accumulators proportionally to the charge they hold, down to zero when needed
@@ -1049,6 +1089,7 @@ local function ration_force(force_name)
   -- a residue can only survive when every donor port is full - the next tick's
   -- collection phase spends it first
   storage.pools[force_name] = math.max(pool, 0)
+  capture_baselines()
 end
 
 local function on_tick(event)
@@ -1478,6 +1519,7 @@ end
 script.on_init(function()
   init_storage()
   verify_upkeep_prototypes()
+  verify_export_port_prototype()
   start_selftest()
   rescan()
   update_tick_handler()
@@ -1495,6 +1537,7 @@ script.on_configuration_changed(function()
   -- (child_regs, force_index_by_name): on_init does not re-run for it
   init_storage()
   verify_upkeep_prototypes()
+  verify_export_port_prototype()
   -- a mod reload closes every window: no Enable-if panel is open, the stale shown
   -- flags would only mislead the tick poll
   storage.enable_guis = {}
@@ -1516,7 +1559,8 @@ script.on_configuration_changed(function()
     }
     unregister(T, true)
   end
-  rescan()  for unit_number, snap in pairs(snapshots) do
+  rescan()
+  for unit_number, snap in pairs(snapshots) do
     local T = storage.transmitters[unit_number]
     if T then
       T.machine_draw = snap.machine_draw
@@ -1627,6 +1671,10 @@ end)
 
 -- the pool is keyed by force name
 remote.add_interface("space-power-transmitter", {
+  -- script API version of this remote interface
+  api_version = function()
+    return 2
+  end,
   pool = function(force_name)
     return storage.pools[force_name]
   end,

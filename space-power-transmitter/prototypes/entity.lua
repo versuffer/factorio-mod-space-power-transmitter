@@ -143,6 +143,12 @@ local function make_upkeep_port(quality)
 end
 
 local entities = {
+  -- the body shell: the v1.2.0 accumulator prototype, unchanged (same name and
+  -- type, so 1.x saves load their transmitters intact). It is a pure node: the
+  -- 5 kJ buffer is deliberately negligible, all grid mechanics live in the hidden
+  -- ports; the accumulator type is used for its native click GUI. The ports are
+  -- dynamic-priority electric-energy-interfaces (not accumulator prototypes), so
+  -- their 1 GJ buffers must not register as battery capacity.
   {
     type = "accumulator",
     name = "space-power-transmitter",
@@ -201,11 +207,11 @@ local entities = {
   {
     -- sound driver: an invisible always-crafting machine (Space Exploration /
     -- modular-nuclear-reactor pattern) - a machine that "works" plays its
-    -- working_sound, which the accumulator transmitter itself cannot do (its
-    -- buffer is static). secondary-input + 1 kW: the hum plays only while the
+    -- working_sound. secondary-input + 1 kW: the hum plays only while the
     -- local network actually has power.
     type = "assembling-machine",
     name = "spt-hum",
+    localised_name = { "entity-name.space-power-transmitter" },
     icon = "__space-power-transmitter__/graphics/icons/space-power-transmitter.png",
     icon_size = 64,
     hidden = true,
@@ -280,27 +286,28 @@ local entities = {
   },
   -- transformer pattern (Power Overload style): two hidden ports wired into the local
   -- grid, working simultaneously:
-  --   spt-import-port  = tertiary source: grid energy covers the deficit TOGETHER with
-  --                      the local accumulators (same priority tier: no reservation of
-  --                      loads, so the accumulators discharge normally); never charges
-  --                      (input flow 0 - surplus collection is the export port's job);
-  --                      buffer 1 GJ = two-tick cushion + throughput ceiling (~60 GW/tick)
-  --   spt-export-port  = ACCUMULATOR-type port: the engine splits the local surplus
-  --                      between all accumulators of the grid proportionally to their
-  --                      EMPTY SPACE, so this port charges from the true surplus while
-  --                      letting local accumulators fill; on a local deficit it
-  --                      discharges back into the local grid FIRST (the donor's own
-  --                      reserve self-heals its link), and the script drains the rest
-  --                      into the transit pool. As the port fills up it naturally
-  --                      yields its share to the local accumulators (self-regulating
+  --   spt-import-port  = dynamic-priority source (input flow 0: never charges -
+  --                      surplus collection is the export port's job); discharges
+  --                      into the local grid on deficit; buffer 1 GJ = two-tick
+  --                      cushion + throughput ceiling (~60 GW/tick)
+  --   spt-export-interface = dynamic-priority port: the engine treats dynamic-priority
+  --                      buffers exactly like accumulators - the local surplus is
+  --                      split between them and the grid's real accumulators
+  --                      proportionally to their demand (empty space capped by the
+  --                      flow limit), so this port charges from the true surplus;
+  --                      on a local deficit it discharges back into the local grid
+  --                      (the donor's own reserve self-heals its link), and the
+  --                      script drains the rest into the transit pool. As the port
+  --                      fills up it naturally yields its share (self-regulating
   --                      greed - no phantom consumption on balanced grids).
   -- ENGINE QUIRK (verified empirically): for electric-energy-interface input_flow_limit
-  -- is applied as raw joules per tick, output_flow_limit as watts (divided by 60);
-  -- accumulator-type entities use standard watt semantics.
-  make_port("spt-import-port", "tertiary", 1e9, 0, nil, "port-import"),
+  -- is applied as raw joules per tick, output_flow_limit as watts (divided by 60) -
+  -- with the dynamic priority both limits are joules per tick. "1TW" is far above the
+  -- buffer size either way, so the port is effectively unthrottled, same as v1.
+  make_port("spt-import-port", "dynamic", 1e9, 0, nil, "port-import"),
   {
-    type = "accumulator",
-    name = "spt-export-port",
+    type = "electric-energy-interface",
+    name = "spt-export-interface",
     localised_name = { "spt-port.port-export" },
     localised_description = { "spt-port.port-description" },
     icons = {
@@ -314,13 +321,15 @@ local entities = {
     energy_source = {
       type = "electric",
       buffer_capacity = power_str(1e9), -- 1 GJ: a self-heal reserve of about 1.7 seconds of upkeep at the default 600 MW, so a downed link can recover from its own reserve
-      usage_priority = "tertiary", -- required for accumulator prototypes (vanilla accumulators use it too)
+      usage_priority = "dynamic", -- engine treats dynamic buffers like accumulators (surplus split by empty space, discharge on deficit)
       input_flow_limit = "1TW",
       output_flow_limit = "1TW",
     },
-    -- no chargable_graphics: the port sits at the transmitter's position and a
-    -- picture here would render the whole transmitter sprite a second time
-    -- (additive glow and shadow layers included)
+    picture = {
+      filename = "__space-power-transmitter__/graphics/entity/blank.png",
+      width = 1,
+      height = 1,
+    },
   },
 }
 

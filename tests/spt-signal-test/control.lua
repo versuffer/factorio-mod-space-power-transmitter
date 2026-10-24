@@ -1,4 +1,4 @@
--- End-to-end test driver for the space-power-transmitter circuit features (1.2.0).
+-- End-to-end test driver for the space-power-transmitter circuit features (1.3.0).
 -- Runs the transmitter through every link state by filling and starving the hidden
 -- upkeep port, asserts the status signal values, exercises the circuit "Enable if"
 -- condition, the shared-pool energy round trip (donor export -> pool -> import ->
@@ -18,6 +18,7 @@
 -- the combinator, wires and values were rebuilt.
 
 local TRANSMITTER = "space-power-transmitter"
+local EXPORT_PORT = "spt-export-interface"
 local UPKEEP_PORT = "spt-upkeep-port-normal"
 local ENABLE_CONDITION_TAG = "spt_enable_condition"
 local SIGNAL_NAMES = { "spt-link-up", "spt-link-failing" }
@@ -48,6 +49,14 @@ local function read_signals(entity, connector)
     values[name] = network and network.get_signal({ type = "virtual", name = name }) or "no-network"
   end
   return values
+end
+
+-- the connector that carries the status broadcast for the transmitter's
+-- wire_out choice (both = both colors, red is as good as any)
+local function out_connector(transmitter)
+  local wires = remote.call("space-power-transmitter", "get_enable_wires", transmitter.unit_number)
+  if wires and wires.wire_out == "green" then return GREEN end
+  return RED
 end
 
 -- expected: { ["spt-link-up"] = 1 } etc.; every other signal must be 0
@@ -102,21 +111,48 @@ script.on_event(defines.events.on_tick, function(event)
   local transmitter = state.transmitter
 
   if state.phase == "persist" then
-    -- this session must be a RELOAD (on_load), not the one that created the map;
-    -- the poll re-attaches the script wires within ~60 ticks, restoring the
-    -- status broadcast, so the check itself waits 70 ticks after the reload
-    if not resumed then return end
+    if not resumed then
+      -- a fresh session waiting for the save/load cycle: keep paying the upkeep
+      -- so the link state written into the save is deterministic (up)
+      local surface = game.surfaces[1]
+      local pos = state.transmitter and state.transmitter.valid and state.transmitter.position or nil
+      local upkeep = pos and upkeep_port(surface, pos) or nil
+      if upkeep then upkeep.energy = upkeep.electric_buffer_size end
+      return
+    end
     if state.fresh_session then
       state.fresh_session = nil
       resumed = false -- re-armed by on_load in the next session
       return
     end
-    if not state.resumed_tick then state.resumed_tick = tick end
-    if tick - state.resumed_tick < 70 then return end
-    -- keep paying the upkeep: the link must be UP when this session's save (the
-    -- config-change run's input) is written at shutdown
+    -- re-resolve at the recorded position (a robustness habit: the stored
+    -- entity reference alone is not trusted)
+    local surface = game.surfaces[1]
+    local pos = state.tx_position
+      or (state.transmitter and state.transmitter.valid and state.transmitter.position or nil)
+    if not pos then
+      say("FAIL persist: no transmitter position recorded")
+      state.failures = state.failures + 1
+      state.phase = "done2"
+      return
+    end
+    transmitter = surface.find_entities_filtered({
+      name = TRANSMITTER, position = pos, radius = 0.1, limit = 1 })[1] or nil
+    if not (transmitter and transmitter.valid) then
+      state.failures = state.failures + 1
+      say("FAIL persist: the transmitter is gone at " .. serpent.line(pos))
+      say("PERSIST RESULT: FAIL")
+      state.phase = "done2"
+      return
+    end
+    state.transmitter = transmitter
+    -- pay the upkeep from the very first resumed tick: the 70-tick window below
+    -- exists for the script-wire rebuild, and an unpaid window would burn the
+    -- banked export charge (10 MJ per tick) and flip the broadcast to "failing"
     local upkeep = upkeep_port(transmitter.surface, transmitter.position)
     if upkeep then upkeep.energy = upkeep.electric_buffer_size end
+    if not state.resumed_tick then state.resumed_tick = tick end
+    if tick - state.resumed_tick < 70 then return end
     local comb = transmitter.surface.find_entities_filtered({
       name = "spt-status-combinator", position = transmitter.position, radius = 0.1, limit = 1 })[1]
     if comb then
@@ -127,7 +163,7 @@ script.on_event(defines.events.on_tick, function(event)
     local info = remote.call("space-power-transmitter", "transmitter_info", transmitter.unit_number)
     local expected = {}
     if info.signal_state then expected[info.signal_state] = 1 end
-    check(state, "persisted transmitter (save/load)", transmitter, RED, expected)
+    check(state, "persisted transmitter (save/load)", transmitter, out_connector(transmitter), expected)
     say("PERSIST RESULT: " .. (state.failures == 0 and "PASS" or ("FAIL (" .. state.failures .. " failures)")))
     -- markers for the config-change run: the next session (a modified mod set) runs
     -- on_configuration_changed and must carry the settings and the link over. The
@@ -273,7 +309,7 @@ script.on_event(defines.events.on_tick, function(event)
     if t == 1 then
       local surface = transmitter.surface
       local export = surface.find_entities_filtered({
-        name = "spt-export-port", position = transmitter.position, radius = 0.1, limit = 1 })[1]
+        name = EXPORT_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
       if export then
         export.energy = 5e8 -- 500 MJ of donor charge
       else
@@ -312,6 +348,96 @@ script.on_event(defines.events.on_tick, function(event)
     if t >= 185 then
       check(state, "link re-established after the pool recovered", transmitter, RED,
         { ["spt-link-up"] = 1 })
+      state.phase, state.phase_start = "selfheal", tick
+    end
+
+  elseif phase == "selfheal" then
+    -- the generation-less network maintained by the export reserve alone: the
+    -- driver pays nothing this phase; the engine discharges the funded export
+    -- port into the grid to serve the upkeep port's refill demand (~1e7 J per
+    -- tick at the default 600 MW). This is exactly how a linked transmitter on
+    -- a network without own generation stays up between pool injections.
+    if t == 1 then
+      local export = transmitter.surface.find_entities_filtered({
+        name = EXPORT_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
+      if export then
+        export.energy = 8e8 -- 80 ticks of upkeep; the relink threshold is 60
+      else
+        state.failures = state.failures + 1
+        say("FAIL selfheal: the export port was not found")
+      end
+    elseif t == 60 then
+      local export = transmitter.surface.find_entities_filtered({
+        name = EXPORT_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
+      local export_energy = export and export.valid and export.energy or 0
+      check(state, "self-heal: the reserve holds the link without generation", transmitter,
+        out_connector(transmitter), { ["spt-link-up"] = 1 })
+      if export_energy > 1e8 and export_energy < 4e8 then
+        say(string.format("PASS self-heal: the reserve discharged into the grid (E=%.0f of 8e8)", export_energy))
+      else
+        state.failures = state.failures + 1
+        say(string.format("FAIL self-heal drain: export E=%.0f, expected ~2e8 (1e7 per tick)", export_energy))
+      end
+    elseif t >= 70 then
+      state.phase, state.phase_start = "surplus", tick
+    end
+
+  elseif phase == "surplus" then
+    -- v1.3: the export port must collect the grid's surplus on the ENGINE side (it is
+    -- a dynamic-priority buffer, not an accumulator prototype): a free-energy source
+    -- covers the upkeep, the leftover flows into the export port - split with a real
+    -- local accumulator - and the script drains the port into the transit pool. The
+    -- driver pays nothing manually in this phase.
+    if t == 1 then
+      local surface = transmitter.surface
+      state.source = surface.create_entity({
+        name = "spt-test-source", position = { 0, 6 }, force = "player" })
+      state.local_acc = surface.create_entity({
+        name = "accumulator", position = { -3, 6 }, force = "player" })
+      remote.call("space-power-transmitter", "set_pool", transmitter.force.name, 0)
+      -- start from an empty port: the assert below must measure what the ENGINE
+      -- collected during this phase, not the donor charge the forcebuild phase
+      -- banked for the persist run (3e8 J would mask a broken collection)
+      local export = surface.find_entities_filtered({
+        name = EXPORT_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
+      if export then export.energy = 0 end
+      if not (state.source and state.local_acc) then
+        state.failures = state.failures + 1
+        say("FAIL surplus: could not create the source or the accumulator")
+        state.phase, state.phase_start = "enable", tick
+      end
+    elseif t >= 170 then
+      local pool = remote.call("space-power-transmitter", "pool", transmitter.force.name) or 0
+      local export = transmitter.surface.find_entities_filtered({
+        name = EXPORT_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
+      local acc = state.local_acc
+      local export_energy = export and export.valid and export.energy or 0
+      if export_energy > 1e8 then
+        say(string.format("PASS surplus collected by the export port (E=%.0f, pool=%.0f pure transit)",
+          export_energy, pool))
+      else
+        state.failures = state.failures + 1
+        say(string.format("FAIL surplus: export=%.0f pool=%.0f (the port did not collect the surplus)",
+          export_energy, pool))
+      end
+      -- the local accumulator barely charges here BY DESIGN: the within-tier split
+      -- is proportional to demand (min(flow limit, empty space)), and the vanilla
+      -- accumulator's 300 kW intake is dwarfed by the port's unthrottled demand -
+      -- identical to v1's accumulator-typed port. The assert guards against the
+      -- port FEEDING the accumulator (a phantom transfer the other way).
+      if acc and acc.valid and acc.energy < 1e6 then
+        say(string.format("PASS surplus split: the local accumulator untouched (acc=%.0f)", acc.energy))
+      else
+        state.failures = state.failures + 1
+        say(string.format("FAIL surplus split: acc=%s (the port must not charge it)",
+          tostring(acc and acc.valid and acc.energy or "gone")))
+      end
+      -- the upkeep was paid by the grid alone the whole phase
+      check(state, "grid-paid upkeep holds the link without driver help", transmitter,
+        out_connector(transmitter), { ["spt-link-up"] = 1 })
+      destroy_if_valid(state.source)
+      destroy_if_valid(state.local_acc)
+      state.source, state.local_acc = nil, nil
       state.phase, state.phase_start = "enable", tick
     end
 
@@ -611,6 +737,12 @@ script.on_event(defines.events.on_tick, function(event)
           serpent.line(read_signals(state.transmitter, RED)), serpent.line(info)))
       end
       say("RESULT: " .. (state.failures == 0 and "PASS" or ("FAIL (" .. state.failures .. " failures)")))
+      -- the body position for the persist phase's re-resolve, and a banked export
+      -- charge so the save/load run covers a funded pool
+      state.tx_position = transmitter.position
+      local export = transmitter.surface.find_entities_filtered({
+        name = EXPORT_PORT, position = transmitter.position, radius = 0.1, limit = 1 })[1]
+      if export then export.energy = 3e8 end
       state.phase, state.phase_start = "persist", tick
     end
   end

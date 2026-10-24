@@ -1,6 +1,6 @@
 ## Space Power Transmitter
 
-Adds Space Power Transmitter that links any planet or space platform - even a moving one - to the common space power grid: bidirectional energy transfer through space over any distance, rationed by demand. Draws a constant upkeep to hold the link (600 MW by default, less at higher quality); the link drops if the local network cannot supply it and restores automatically once it can. Unlocked with Cryogenic science (researchable on Aquilo).
+Adds Space Power Transmitter that links any planet or space platform - even a moving one - to the common space power grid: bidirectional energy transfer through space over any distance, rationed by demand. Draws a constant upkeep to hold the link (600 MW by default, less at higher quality); the link drops if the local network cannot supply it and restores automatically once it can. Can be unlocked on Aquilo.
 
 ## New technologies
 
@@ -15,6 +15,7 @@ Adds Space Power Transmitter that links any planet or space platform - even a mo
     -   Connects the local power network of its surface to the common space power grid;
     -   Energy flows in both directions between all linked surfaces of the force - through space, over any distance (moving space platforms included);
     -   Energy is rationed proportionally to demand when production falls short (upkeep first, machines second);
+    -   Throughput is capped at ~60 GW per transmitter: the hidden import port holds a 1 GJ buffer that is refilled once per tick, so one transmitter pair can transfer at most 60 GW - add more transmitters on the network for more power;
     -   Draws a constant upkeep to hold the link (600 MW by default; uncommon, rare, epic and legendary quality draw 5/6, 4/6, 3/6 and 1/6 of that value);
     -   If the local network cannot supply the upkeep, the link drops (a custom alert with a map pin is raised); it recovers from local generation only and relinks automatically once enough power is available again;
     -   Can be wired into a circuit network: broadcasts its link status as virtual signals - `spt-link-up` is 1 while the link is healthy, `spt-link-failing` is 1 while the upkeep is not being paid (the link drops within seconds), and both absent means the link is down;
@@ -25,7 +26,7 @@ Adds Space Power Transmitter that links any planet or space platform - even a mo
 
 -   Upkeep power is configurable in settings (6 MW - 1 GW, set in kilowatts; changing it requires a restart);
 -   Quality tiers reduce the upkeep drain;
--   The transmitter itself is a pure node: all grid mechanics run through hidden internal ports (visible in the electric network GUI as "Space Power Transmitter" entries);
+-   The transmitter itself is a pure node: all grid mechanics run through hidden internal ports (visible in the electric network GUI as "Space Power Transmitter" entries); the ports are dynamic-priority interfaces, so they do not inflate the network's battery capacity;
 -   The transmitter can be freely deconstructed and moved; the link state survives saving, loading and mod updates (a force change rebuilds the link);
 
 ## Existing saves
@@ -33,10 +34,6 @@ Adds Space Power Transmitter that links any planet or space platform - even a mo
 - Mod does not change vanilla entity or item properties;
 - Safe to add to an existing save; removing the mod drops all links (banked energy is not refunded);
 - Mod is mostly safe for using with existing save but it is ***STRONGLY RECOMMENDED*** to make backup before installing ***OR*** updating mod version;
-
-## Development
-
-- `tests/run.sh` - headless end-to-end tests of the circuit features (link status signals, Enable if, save/load rebuild); see `tests/README.md`.
 
 ## Compatibility
 

@@ -1,4 +1,13 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.3.0
+Date: 24. 10. 2026
+  Features:
+  - The hidden import and export ports are dynamic-priority electric-energy-interfaces now: the import port switched from the tertiary priority, and the accumulator-typed export port was replaced by a fresh interface. The network's battery capacity is no longer inflated by up to 2 GJ per transmitter.
+  Bugfixes:
+  - The hidden sound driver entity has a proper name in the electric network info (it showed as an unknown-key placeholder before).
+  Changes:
+  - Transmitters built under 1.x keep working after the update (the body loads unchanged). Their old export port entities are removed by the engine together with any banked charge (up to 1 GJ per transmitter); the fresh ports refill as soon as the link is up again. A network without own generation may need a moment of generation (or a console command) to re-establish its links after the update.
+---------------------------------------------------------------------------------------------------
 Version: 1.2.0
 Date: 24. 10. 2026
   Features:

@@ -1,0 +1,12 @@
+{
+  "name": "spt-migration-test",
+  "version": "0.1.0",
+  "title": "SPT Migration Test",
+  "author": "versuffer",
+  "description": "Headless migration test driver for the space-power-transmitter: builds a link on a map hosted with the 1.x mod (an export accumulator port), then re-hosts the same save with the current mod and asserts the on_configuration_changed migration carried the record, the fresh dynamic-priority export port and the link over. Enabled only by tests/run.sh in a temporary mod directory; never ship or enable it in a real game.",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1.22",
+    "space-power-transmitter >= 1.2.0"
+  ]
+}

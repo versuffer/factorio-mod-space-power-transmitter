@@ -1,0 +1,13 @@
+{
+  "name": "spt-load-test",
+  "version": "0.1.0",
+  "title": "SPT Load Test",
+  "author": "versuffer",
+  "description": "Headless load-test driver for the space-power-transmitter: a 500 GW primary-output source on one isolated network feeds a 400 GW primary-input load on another isolated network through the transmitter link. Enabled only by tests/loadtest.sh in a temporary mod directory; never ship or enable it in a real game.",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1.22",
+    "space-age >= 2.1.22",
+    "space-power-transmitter >= 1.3.0"
+  ]
+}
